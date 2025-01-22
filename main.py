@@ -18,13 +18,17 @@ def train_per_epoch(args, dataloader, net, optimizer, scheduler, device):
     
     representations = None
     label_list = None
+    is_tuple = False
     
     for data in dataloader:
         inputs, labels = data
         
         if args.model != 'ijepa':
-            inputs = torch.stack(inputs)
+            if isinstance(inputs, tuple):
+                is_tuple = True
+                inputs = torch.stack(inputs)
             inputs, labels = inputs.to(device), labels.to(device)
+        
         loss = net(inputs, device)
         
         optimizer.zero_grad()
@@ -32,12 +36,14 @@ def train_per_epoch(args, dataloader, net, optimizer, scheduler, device):
         optimizer.step()
         
         if args.test == 'knn':
+            if is_tuple:
+                inputs = inputs[2]
             with torch.no_grad():
                 if representations == None:
-                    representations = net.encoding(inputs[2])
+                    representations = net.encoding(inputs)
                     label_list = labels
                 else:
-                    representations = torch.cat((representations, net.encoding(inputs[2])), dim=0)
+                    representations = torch.cat((representations, net.encoding(inputs)), dim=0)
                     label_list = torch.cat((label_list, labels), dim=0)
             
         running_loss += loss.item()
@@ -90,7 +96,7 @@ def fewshot_test(testloader, net, args, device):
 def crossdomain_test(args, net, device, outputs_log):
     print('--- crossdomain test ---')
     if args.dataset == 'BSCD':
-        dataset_list = ['CropDisease', 'EuroSAT', 'ISIC', 'ChestX']
+        dataset_list = ['CropDisease','EuroSAT', 'ISIC', 'ChestX']
     elif args.dataset == 'FWT':
         dataset_list = ['cars', 'cub', 'places', 'plantae']
     else:
@@ -152,12 +158,12 @@ def main():
     
     net = load_model(args)
     net.to(device)
-    #net.load_state_dict(torch.load('vicreg_400ep_0.03lr_mixup.pt'))
+    net.load_state_dict(torch.load('ijepa_400ep_0.01lr.pt'))
     
     if args.train:
         trainloader, testloader, valloader, num_classes = dataloader.load_dataset(args, args.dataset)
         optimizer,scheduler = set_parameters(args, net, len(trainloader))
-        if net.ipe:
+        if hasattr(net, 'ipe'):
             net.ipe = len(trainloader)
         print(f"--- train ---")
         #data loader 600으로 변경하기

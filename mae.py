@@ -7,78 +7,88 @@ import copy
 import math
 import numpy as np
 
+
 from utils import split_support_query_set
+
 from backbone import visiontransformer as vit
 
 from tqdm import tqdm
 
-from models.ijepa_utils import repeat_interleave_batch, apply_masks
 
-
-class I_JEPA(nn.Module):
-    def __init__(self, num_epochs):
-        super(I_JEPA, self).__init__()
-        self.img_size = 84
+class MAE(nn.Module):
+    def __init__(self):
+        super(MAE, self).__init__()
         self.patch_size = 6
-        self.num_patches = (self.img_size // self.patch_size) ** 2
-        self.encoder, self.predictor = self.load_backbone()
-        self.outdim = self.encoder.embed_dim
-        self.target_encoder = copy.deepcopy(self.encoder)
-        self.ipe = 9600
-        
-        for param in self.target_encoder.parameters():
-            param.requires_grad = False
-        
-        self.momentum_scheduler = (0.996 + i * (1.0 - 0.996) / (self.ipe * num_epochs)
-                        for i in range(int(self.ipe * num_epochs) + 1))
+        self.num_patches = (84 // self.patch_size) ** 2
+        self.encoder, self.decoder = self.load_backbone()
     
     def load_backbone(self):
-        encoder = vit.__dict__['vit_large'](img_size=[self.img_size], patch_size=self.patch_size)
-        predictor = vit.__dict__['vit_predictor'](patch_size=6, num_patches= (self.img_size//self.patch_size) ** 2, embed_dim=encoder.embed_dim, predictor_embed_dim = encoder.embed_dim//2, num_heads=encoder.num_heads)
+        encoder = vit.__dict__['vit_tiny'](img_size=[84], patch_size=self.patch_size, add_cls_token=False) 
+        decoder = vit.__dict__['vit_predictor'](patch_size=self.patch_size, num_patches= self.num_patches, embed_dim=encoder.embed_dim, predictor_embed_dim=encoder.embed_dim // 2, num_heads=encoder.num_heads,
+                                                add_cls_token=False)
         
         #encoder = vit.vit_tiny()
         #predictor = vit.vit_predictor()
         
-        return encoder, predictor
+        return encoder, decoder
+    
+    def random_masking(self, batch_size, num_patches, mask_ratio, device):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
+        N, L = batch_size, num_patches
+        len_keep = int(L * (1 - mask_ratio)) # 0.25 * L
+        
+        noise = torch.rand(N, L, device=device)  # noise in [0, 1]
+        
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove # 0 3 4 5 1 2
+        ids_restore = torch.argsort(ids_shuffle, dim=1) # [0, 4, 5, 1, 2, 3] -> 원래 순서로 복원
+        
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep] # N kL
+        
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=device) 
+        mask[:, :len_keep] = 0 # 0 0 1 1 1 1
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore) # masking된 부분은 1, unmasked 0으로 표시 -> 0 1 1 0 1 1
+        
+        return mask, ids_restore, ids_keep
+    
+    def patchify(self, imgs):
+        """
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 *3)
+        """
+        p = self.patch_size
+        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+        
+        h = w = imgs.shape[2] // p
+        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p)) # b 3 14 6 14 6
+        x = torch.einsum('nchpwq->nhwpqc', x) # b 14 14 6 6 3
+        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3)) # b 14*14 36*3
+        return x
     
     def forward(self, inputs, device):
-        udata, masks_enc, masks_pred = inputs[0], inputs[1], inputs[2]
+        x = inputs
+        mask, ids_restore, ids_keep = self.random_masking(x.size(0), self.num_patches, 0.75, device)
         
-        # momentum update of target encoder
-        with torch.no_grad():
-            m = next(self.momentum_scheduler)
-            for param_q, param_k in zip(self.encoder.parameters(), self.target_encoder.parameters()):
-                param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+        x = self.encoder(x, ids_keep)
+        pred = self.decoder(x, ids_restore=ids_restore)
         
-        def load_imgs():
-            # -- unsupervised imgs
-            imgs = udata[0].to(device, non_blocking=True)
-            masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
-            masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
-            return (imgs, masks_1, masks_2)
+        target = self.patchify(inputs)
         
-        imgs, masks_enc, masks_pred = load_imgs()
+        # normalization
+        mean = target.mean(dim=-1, keepdim=True)
+        var = target.var(dim=-1, keepdim=True)
+        target = (target - mean) / (var + 1.e-6)**.5
         
-        def forward_target():
-            with torch.no_grad():
-                h = self.target_encoder(imgs) # B num_patches D
-                h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim => patch 별
-                B = len(h)
-                # -- create targets (masked regions of h)
-                h = apply_masks(h, masks_pred) #prediction할 부분 -> num_pred * B, K, D
-                h = repeat_interleave_batch(h, B, repeat=len(masks_enc)) # num_context * num_pred * B, K, D
-                return h
-            
-        def forward_context():
-            z = self.encoder(imgs, masks_enc)
-            z = self.predictor(z, masks_enc, masks_pred)
-            return z
-        
-        h = forward_target()
-        z = forward_context()
-        loss = F.smooth_l1_loss(z, h)
-        #distance = torch.pairwise_distance(h, z).view(-1, len(masks_enc) * len(masks_pred), h.size(1)) # batchsize 4 K
-        #loss = torch.mean(torch.sum(distance, dim=-1))
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1) # [N, L], mean loss per patch
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         
         return loss
     
@@ -87,7 +97,7 @@ class I_JEPA(nn.Module):
             correct = 0
             total = 0
             
-            x = torch.mean(self.target_encoder(inputs), dim=1) # B K D -> B D
+            x = torch.mean(self.encoder(inputs), dim=1) # B K D -> B D
             batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
             x = batchnorm(x)
             
@@ -118,7 +128,7 @@ class I_JEPA(nn.Module):
             correct, total = 0, 0
             
             for x_support, x_query, y_support, y_query in tasks:
-                net = copy.deepcopy(self.target_encoder)
+                net = copy.deepcopy(self.encoder)
                 classifier = nn.Sequential(
                     nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
                     nn.Linear(self.encoder.embed_dim, args.train_num_ways)).to(device)

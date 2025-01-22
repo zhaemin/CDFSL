@@ -14,69 +14,7 @@ import torch.nn as nn
 
 
 from models.ijepa_utils import trunc_normal_, repeat_interleave_batch, apply_masks
-
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False): # x,y 좌표를 sin, cos함수를 통해 embedding
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size, dtype=float)
-    grid_w = np.arange(grid_size, dtype=float)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
-
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
-    """
-    grid_size: int of the grid length
-    return:
-    pos_embed: [grid_size, embed_dim] or [1+grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid = np.arange(grid_size, dtype=float)
-    pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, grid) #0~n-1에 대한 sin-cos embed 계산
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0 #embed dim에 sin cos을 절반씩 할당
-    omega = np.arange(embed_dim // 2, dtype=float) 
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega   # (D/2,)
-
-    pos = pos.reshape(-1)   # (M,)
-    out = np.einsum('m,d->md', pos, omega)   # (M, D/2), outer product
-
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
+from backbone.pos_embed import get_2d_sincos_pos_embed
 
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
@@ -96,7 +34,7 @@ class DropPath(nn.Module):
     def __init__(self, drop_prob=None):
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
-
+        
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
 
@@ -110,7 +48,7 @@ class MLP(nn.Module):
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
-
+        
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
@@ -126,21 +64,21 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
-
+        
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-
+        
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
+        
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-
+        
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -177,12 +115,13 @@ class PatchEmbed(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
-
+        
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
         return x
 
 
@@ -231,19 +170,23 @@ class VisionTransformerPredictor(nn.Module):
         drop_path_rate=0.0,
         norm_layer=nn.LayerNorm,
         init_std=0.02,
+        add_class_token=False,
+        patch_size=6,
         **kwargs
     ):
         super().__init__()
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
+        self.add_cls_token = add_class_token
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        # --
-        self.predictor_pos_embed = nn.Parameter(torch.zeros(1, num_patches, predictor_embed_dim),
-                                                requires_grad=False)
-        predictor_pos_embed = get_2d_sincos_pos_embed(self.predictor_pos_embed.shape[-1],
-                                                    int(num_patches**.5),
-                                                    cls_token=False)
-        self.predictor_pos_embed.data.copy_(torch.from_numpy(predictor_pos_embed).float().unsqueeze(0))
+        # ------
+        if add_class_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, predictor_embed_dim), requires_grad=False)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(num_patches**.5), cls_token=self.add_cls_token)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         # --
         self.predictor_blocks = nn.ModuleList([
             Block(
@@ -252,7 +195,8 @@ class VisionTransformerPredictor(nn.Module):
             for i in range(depth)])
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
-        # ------
+        self.decoder_proj = nn.Linear(predictor_embed_dim, patch_size ** 2 * 3, bias=True)
+        # --
         self.init_std = init_std
         trunc_normal_(self.mask_token, std=self.init_std)
         self.apply(self._init_weights)
@@ -278,30 +222,67 @@ class VisionTransformerPredictor(nn.Module):
             trunc_normal_(m.weight, std=self.init_std)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x, masks_x=None, masks=None, ids_restore=None):
+        if ids_restore == None:
+            return self.forward_predictor(x, masks_x, masks)
+        else:
+            return self.forward_decoder(x, ids_restore)
+    
+    def forward_decoder(self, x, ids_restore):
+        # embed tokens
+        x = self.predictor_embed(x)
+        
+        # append mask tokens to sequence
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1) # 1 1 pd -> b (N+1-unmasked) 1
+        if self.add_cls_token:
+            x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+            x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle -> 원래 patch 위치로 mask token 이동
+            x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+        else:
+            x_ = torch.cat([x, mask_tokens], dim=1)
+            x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2])) 
+        
+        # add pos embed
+        x = x + self.pos_embed
+        
+        # apply Transformer blocks
+        for blk in self.predictor_blocks:
+            x = blk(x)
+        x = self.predictor_norm(x)
+        
+        # predictor projection
+        x = self.decoder_proj(x)
+        
+        # remove cls token
+        if self.add_cls_token:
+            x = x[:, 1:, :]
+        
+        return x
 
-    def forward(self, x, masks_x, masks): # x=encoder를 통과한 context, masks_x = mask_enc, masks = mask_pred
+    def forward_predictor(self, x, masks_x, masks): # x=encoder를 통과한 context, masks_x = mask_enc, masks = mask_pred
         assert (masks is not None) and (masks_x is not None), 'Cannot run predictor without mask indices'
-
+        
         if not isinstance(masks_x, list):
             masks_x = [masks_x]
-
+            
         if not isinstance(masks, list):
             masks = [masks]
-
+            
         # -- Batch Size
         B = len(x) // len(masks_x)
-
+        
         # -- map from encoder-dim to pedictor-dim
         x = self.predictor_embed(x) # B K D
-
+        
         # -- add positional embedding to x tokens
-        x_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1) #B N D
+        x_pos_embed = self.pos_embed.repeat(B, 1, 1) #B N D
         x += apply_masks(x_pos_embed, masks_x) # context 부분의 position embedding만 남겨서 더함 -> num_context * B, K, D
-
+        
         _, N_ctxt, D = x.shape
-
+        
         # -- concat mask tokens to x
-        pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
+        pos_embs = self.pos_embed.repeat(B, 1, 1)
         pos_embs = apply_masks(pos_embs, masks) # predict할 부분의 position embedding -> num_predict * B, K_pred, D
         pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x)) #context 수 만큼 반복, num_context * num_predict * B, K_pred, D
         # --
@@ -310,16 +291,16 @@ class VisionTransformerPredictor(nn.Module):
         pred_tokens += pos_embs #mask token에 predict mask의 position embedding을 더함
         x = x.repeat(len(masks), 1, 1) # num_predict * num_context * B, K, D
         x = torch.cat([x, pred_tokens], dim=1) # a+1, a+2, a+3 ...
-
+        
         # -- fwd prop
         for blk in self.predictor_blocks:
             x = blk(x)
         x = self.predictor_norm(x)
-
+        
         # -- return preds for mask tokens
         x = x[:, N_ctxt:] # pred token만 분리
         x = self.predictor_proj(x)
-
+        
         return x
 
 
@@ -343,11 +324,13 @@ class VisionTransformer(nn.Module):
         drop_path_rate=0.0,
         norm_layer=nn.LayerNorm,
         init_std=0.02,
+        add_cls_token=False,
         **kwargs
     ):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.add_cls_token = add_cls_token
         # --
         self.patch_embed = PatchEmbed(
             img_size=img_size[0],
@@ -356,10 +339,12 @@ class VisionTransformer(nn.Module):
             embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
         # --
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim), requires_grad=False)
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1],
-                                            int(self.patch_embed.num_patches**.5),
-                                            cls_token=False)
+        if add_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim), requires_grad=False)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.patch_embed.num_patches**.5), cls_token=self.add_cls_token)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         # --
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -377,7 +362,7 @@ class VisionTransformer(nn.Module):
     def fix_init_weight(self):
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
-
+            
         for layer_id, layer in enumerate(self.blocks):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
@@ -399,26 +384,34 @@ class VisionTransformer(nn.Module):
         if masks is not None:
             if not isinstance(masks, list):
                 masks = [masks]
-
+        
         # -- patchify x
         x = self.patch_embed(x)
         B, N, D = x.shape
-
+        
         # -- add positional embedding to x
-        pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
-        x = x + pos_embed
-
+        if self.add_cls_token:
+            x = x + pos_embed[:, 1, :]
+        else:
+            pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
+            x = x + pos_embed
+        
         # -- mask x
         if masks is not None:
             x = apply_masks(x, masks)
-
+        
+        if self.add_cls_token:
+            cls_token = self.cls_token + self.pos_embed[:, :1, :]
+            cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+        
         # -- fwd prop
         for i, blk in enumerate(self.blocks):
             x = blk(x)
-
+        
         if self.norm is not None:
             x = self.norm(x)
-
+        
         return x
 
     def interpolate_pos_encoding(self, x, pos_embed): # 인수로 들어온 num patches(position embedding)과 실제 num patches가 다를 때 pos_embed를 interpolate
@@ -468,7 +461,8 @@ def vit_base(patch_size=16, **kwargs):
 
 def vit_large(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4,
+        # change embed dim -> original : 1024
+        patch_size=patch_size, embed_dim=192, depth=24, num_heads=16, mlp_ratio=4,
         qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
