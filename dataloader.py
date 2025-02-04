@@ -112,16 +112,16 @@ def load_dataset(args, dataset):
         if args.model == 'ijepa':
             trainloader, testloader, valloader, num_classes = load_ijepa_data(args)
         else:
-            ssltransform = SSLTransform(84, args.model)
+            ssltransform = SSLTransform(args.img_size, args.model)
             
             transform_train = transforms.Compose([
-                    transforms.RandomResizedCrop(84, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
+                    transforms.RandomResizedCrop(args.img_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
                     transforms.RandomHorizontalFlip(),
                     transforms.ToTensor(),
                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
             
             transform_test = transforms.Compose([
-                transforms.Resize(84, antialias=True),
+                transforms.Resize(args.img_size, antialias=True),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))])
             
@@ -155,8 +155,8 @@ def load_dataset(args, dataset):
         num_classes = None
         
         transform_test = transforms.Compose([ 
-            transforms.Resize(84, antialias=True),
-            transforms.CenterCrop(84),
+            transforms.Resize(args.img_size, antialias=True),
+            transforms.CenterCrop(args.img_size),
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))])
         
@@ -171,13 +171,13 @@ def load_dataset(args, dataset):
 
 def load_ijepa_data(args):
     transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(84, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
-            transforms.RandomHorizontalFlip(),
+            transforms.RandomResizedCrop(args.img_size, scale=(0.3, 1.0), interpolation=3),  # 3 is bicubic
+            #transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     
     transform_test = transforms.Compose([
-        transforms.Resize(84, antialias=True),
+        transforms.Resize(args.img_size, antialias=True),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))])
     
@@ -192,8 +192,8 @@ def load_ijepa_data(args):
     test_sampler = FewShotSampler(testset_labels, args.test_num_ways, args.num_shots, args.num_queries, 600, num_tasks=1)
     val_sampler = FewShotSampler(valset_labels, args.test_num_ways, args.num_shots, args.num_queries, 100, num_tasks=1)
     
-    mask_collator = MBMaskCollator(input_size=(84, 84), patch_size=6, allow_overlap=True)
-    trainloader = DataLoader(trainset, batch_size=args.batch_size, collate_fn = mask_collator, shuffle=True, drop_last=True, num_workers=2, pin_memory=True)
+    mask_collator = MBMaskCollator(input_size=(args.img_size, args.img_size), patch_size=args.patch_size, allow_overlap=False)
+    trainloader = DataLoader(trainset, batch_size=args.batch_size, collate_fn = mask_collator, shuffle=True, drop_last=True, num_workers=10, pin_memory=True)
     valloader = DataLoader(valset, batch_sampler=val_sampler, pin_memory=True)
     
     if args.test == 'fewshot' or args.test == 'crossdomain':

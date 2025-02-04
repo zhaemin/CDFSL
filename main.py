@@ -24,7 +24,7 @@ def train_per_epoch(args, dataloader, net, optimizer, scheduler, device):
         inputs, labels = data
         
         if args.model != 'ijepa':
-            if isinstance(inputs, tuple):
+            if isinstance(inputs, list):
                 is_tuple = True
                 inputs = torch.stack(inputs)
             inputs, labels = inputs.to(device), labels.to(device)
@@ -99,6 +99,8 @@ def crossdomain_test(args, net, device, outputs_log):
         dataset_list = ['CropDisease','EuroSAT', 'ISIC', 'ChestX']
     elif args.dataset == 'FWT':
         dataset_list = ['cars', 'cub', 'places', 'plantae']
+    elif args.dataset == 'all':
+        dataset_list = ['CropDisease','EuroSAT', 'ISIC', 'ChestX','cars', 'cub', 'places', 'plantae']
     else:
         print('invalid dataset')
         return
@@ -133,10 +135,10 @@ def train(args, trainloader, testloader, valloader, net, optimizer, scheduler, d
         writer.add_scalar('train / train_loss', running_loss, epoch+1)
         writer.add_scalar('train / learning_rate', lr, epoch+1)
         
-        torch.save(net.state_dict(), f'./{args.model}_{args.epochs}ep_{args.learningrate}lr_2.pt')
+        torch.save(net.state_dict(), f'./{args.model}_{args.epochs}ep_{args.learningrate}lr_{args.log}.pt')
         
-        if (epoch+1) % 100 == 0:
-            torch.save(net.state_dict(), f'./{args.model}_{epoch+1}ep_{args.learningrate}lr_2.pt')
+        if acc > max_acc:
+            torch.save(net.state_dict(), f'./{args.model}_best_ep_{args.learningrate}lr_{args.log}.pt')
         
         running_loss = 0.0
         
@@ -150,15 +152,22 @@ def main():
     cur_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     
     if args.train:
-        outputs_log = open(f'./outputs/{args.model}_{args.epochs}ep_{args.learningrate}lr_{cur_time}.txt','w')
-        writer = SummaryWriter(f'./logs/{args.model}_{args.epochs}ep_{args.learningrate}lr_{cur_time}')
+        outputs_log = open(f'./outputs/{args.model}_{args.epochs}ep_{args.learningrate}lr_{args.log}_{cur_time}.txt','w')
+        writer = SummaryWriter(f'./logs/{args.model}_{args.epochs}ep_{args.learningrate}lr_{args.log}_{cur_time}')
     elif args.test:
-        outputs_log = open(f'./outputs/{args.model}_test_{args.dataset}_{cur_time}.txt','w')
+        outputs_log = open(f'./outputs/{args.model}_test_{args.dataset}_{cur_time}_{args.log}.txt','w')
         writer = None
     
     net = load_model(args)
     net.to(device)
-    net.load_state_dict(torch.load('ijepa_400ep_0.01lr.pt'))
+    
+    trainable_parameters = sum(p.numel() for p in net.encoder.parameters() if p.requires_grad)
+    total_parameters = sum(p.numel() for p in net.encoder.parameters())
+    print(trainable_parameters, total_parameters)
+    net.load_state_dict(torch.load('ijepa_20ep_1e-07lr_use_DINOweight.pt'))
+    
+    #net.encoder.load_state_dict(torch.load('./checkpoint/dino_deitsmall16_pretrain.pth'))
+    #net.target_encoder.load_state_dict(torch.load('./checkpoint/dino_deitsmall16_pretrain.pth'))
     
     if args.train:
         trainloader, testloader, valloader, num_classes = dataloader.load_dataset(args, args.dataset)

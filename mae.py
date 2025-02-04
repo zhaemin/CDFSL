@@ -14,23 +14,28 @@ from backbone import visiontransformer as vit
 
 from tqdm import tqdm
 
-
-class MAE(nn.Module):
-    def __init__(self):
-        super(MAE, self).__init__()
-        self.patch_size = 6
-        self.num_patches = (84 // self.patch_size) ** 2
-        self.encoder, self.decoder = self.load_backbone()
+class MIM(nn.Module):
+    def __init__(self, img_size, patch_size):
+        super(MIM, self).__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (self.img_size // self.patch_size) ** 2
     
-    def load_backbone(self):
-        encoder = vit.__dict__['vit_tiny'](img_size=[84], patch_size=self.patch_size, add_cls_token=False) 
-        decoder = vit.__dict__['vit_predictor'](patch_size=self.patch_size, num_patches= self.num_patches, embed_dim=encoder.embed_dim, predictor_embed_dim=encoder.embed_dim // 2, num_heads=encoder.num_heads,
-                                                add_cls_token=False)
-        
-        #encoder = vit.vit_tiny()
-        #predictor = vit.vit_predictor()
+    def load_backbone(self, encoder_add_cls_token=False, pred_add_cls_token=False):
+        print('img_size: ',self.img_size)
+        print('patch_size: ',self.patch_size)
+        print('num_patches: ',self.num_patches)
+        encoder = vit.__dict__['vit_small'](img_size=[self.img_size], patch_size=self.patch_size, add_cls_token=encoder_add_cls_token)
+        decoder = vit.__dict__['vit_predictor'](patch_size=self.patch_size, num_patches= (self.img_size//self.patch_size) ** 2, embed_dim=encoder.embed_dim, 
+                                                predictor_embed_dim=encoder.embed_dim//2, num_heads=encoder.num_heads, add_cls_token=pred_add_cls_token)
         
         return encoder, decoder
+
+
+class MAE(MIM):
+    def __init__(self, img_size, patch_size):
+        super(MAE, self).__init__(img_size, patch_size)
+        self.encoder, self.decoder = self.load_backbone(encoder_add_cls_token=True, pred_add_cls_token=True)
     
     def random_masking(self, batch_size, num_patches, mask_ratio, device):
         """
@@ -91,13 +96,19 @@ class MAE(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         
         return loss
-    
+
     def fewshot_acc(self, args, inputs, labels, device):
         with torch.no_grad():
+            if args.model == 'ijepa':
+                encoder = copy.deepcopy(self.target_encoder)
+            else:
+                encoder = copy.deepcopy(self.encoder)
+                
             correct = 0
             total = 0
             
-            x = torch.mean(self.encoder(inputs), dim=1) # B K D -> B D
+            x = torch.mean(encoder(inputs), dim=1) # B K D -> B D
+            #x = encoder(inputs)[:, 0, :] # use cls token
             batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
             x = batchnorm(x)
             
@@ -128,7 +139,11 @@ class MAE(nn.Module):
             correct, total = 0, 0
             
             for x_support, x_query, y_support, y_query in tasks:
-                net = copy.deepcopy(self.encoder)
+                if args.model == 'ijepa':
+                    net = copy.deepcopy(self.target_encoder)
+                else:
+                    net = copy.deepcopy(self.encoder)
+                    
                 classifier = nn.Sequential(
                     nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
                     nn.Linear(self.encoder.embed_dim, args.train_num_ways)).to(device)
@@ -140,6 +155,8 @@ class MAE(nn.Module):
                 with torch.no_grad():
                     shots   = torch.mean(net(x_support), dim=1)
                     queries = torch.mean(net(x_query), dim=1)
+                    #shots   = net(x_support)[:, 0, :]
+                    #queries = net(x_query)[:, 0, :]
                 for _ in range(100):
                     with torch.no_grad():
                         shots   = shots.detach()
@@ -171,3 +188,79 @@ class MAE(nn.Module):
             
         accuracy = total_acc / len(loader)
         return accuracy
+
+
+
+'''
+    def ft_fewshot_acc(self, loader, device, n_iters, args):
+        #linear probing
+        total_acc = 0
+        
+        for data in tqdm(loader, desc="Test ..."):
+            inputs, labels = data
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            tasks = split_support_query_set(inputs, labels, device, num_tasks=1, num_shots=args.num_shots)
+            correct, total = 0, 0
+            
+            for x_support, x_query, y_support, y_query in tasks:
+                net = copy.deepcopy(self.encoder)
+                weight_p = nn.Parameter(torch.randn(1, self.num_patches, 1, device=device))
+                classifier = nn.Sequential(
+                    nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
+                    nn.Linear(self.encoder.embed_dim, args.train_num_ways)).to(device)
+                optimizer = optim.SGD([weight_p]+list(classifier.parameters()), lr=0.01, momentum=0.9, weight_decay=0.001)
+                
+                net.eval()
+                classifier.train()
+                
+                with torch.no_grad():
+                    shots   = net(x_support)
+                    queries = net(x_query)
+                
+                for _ in range(100):
+                    with torch.no_grad():
+                        shots   = shots.detach()
+                        
+                    rand_id = np.random.permutation(args.train_num_ways * args.num_shots)
+                    batch_indices = [rand_id[i*4:(i+1)*4] for i in range(rand_id.size//4)]
+                    for id in batch_indices:
+                        x_train = shots[id]
+                        y_train = y_support[id]
+                        
+                        weight_p = F.softmax(weight_p.detach(), dim=1) # F.softmax 적용해보기
+                        weight_p_repeat = weight_p.repeat(x_train.size(0), 1, 1)
+                        
+                        x_train = torch.einsum('bkd, bpa -> bda', x_train, weight_p_repeat).squeeze()
+                        shots_pred = classifier(x_train)
+                        loss = F.cross_entropy(shots_pred, y_train)
+                        
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                
+                net.eval()
+                classifier.eval()
+                
+                with torch.no_grad():
+                    weight_p = F.softmax(weight_p.detach(), dim=1)
+                    weight_p_repeat = weight_p.repeat(queries.size(0), 1, 1)
+                    shots =  torch.einsum('bkd, bpa -> bda', shots, weight_p).squeeze()
+                    queries = torch.einsum('bkd, bpa -> bda', queries, weight_p).squeeze()
+
+                    shots = F.normalize(shots) # s d
+                    queries = F.normalize(queries) # q d
+                    prototypes = F.normalize(torch.sum(shots.view(5, args.num_shots, -1), dim=1), dim=1) # 5 d
+                    
+                    logits = torch.einsum('qd, wd -> qw', queries, prototypes)
+                    _, predicted = torch.max(logits.data, 1)
+                    correct += (predicted == y_query).sum().item()
+                    total += y_query.size(0)
+                    
+            acc = 100 * correct / total
+            total_acc += acc
+            
+        accuracy = total_acc / len(loader)
+        return accuracy
+
+'''

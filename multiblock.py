@@ -28,7 +28,7 @@ class MaskCollator(object):
         aspect_ratio=(0.75, 1.5),
         nenc=1,
         npred=4,
-        min_keep=4,
+        min_keep=10,
         allow_overlap=False
     ):
         super(MaskCollator, self).__init__()
@@ -56,7 +56,7 @@ class MaskCollator(object):
         _rand = torch.rand(1, generator=generator).item()
         # -- Sample block scale
         min_s, max_s = scale
-        mask_scale = min_s + _rand * (max_s - min_s)
+        mask_scale = min_s + _rand * (max_s - min_s) # 0.15 ~ 0.2
         max_keep = int(self.height * self.width * mask_scale)
         # -- Sample block aspect-ratio
         min_ar, max_ar = aspect_ratio_scale
@@ -133,9 +133,9 @@ class MaskCollator(object):
             generator=g,
             scale=self.enc_mask_scale,
             aspect_ratio_scale=(1., 1.))
-
+        
         collated_masks_pred, collated_masks_enc = [], []
-        min_keep_pred = self.height * self.width # block 기준 height and width
+        min_keep_pred = self.height * self.width # block 기준 height and width -> 각 block의 크기 통일
         min_keep_enc = self.height * self.width
         for _ in range(B):
 

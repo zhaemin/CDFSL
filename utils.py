@@ -8,9 +8,7 @@ from warmup import WarmupCosineAnnealingScheduler
 
 def parsing_argument():
     parser = argparse.ArgumentParser(description="argparse_test")
-    
-    parser.add_argument('-e', '--epochs', metavar='int', type=int, help='epochs', default=2)
-    parser.add_argument('-lr', '--learningrate', metavar='float', type=float, help='lr', default=0.01)
+
     parser.add_argument('-d', '--dataset', metavar='str', type=str, help='dataset [miniimagenet, cifarfs]', default='miniimagenet')
     parser.add_argument('-opt', '--optimizer', metavar='str', type=str, help='optimizer [adam, sgd]', default='sgd')
     parser.add_argument('-crt', '--criterion', metavar='str', type=str, help='criterion [ce, mse]', default='ce')
@@ -22,7 +20,14 @@ def parsing_argument():
     parser.add_argument('-tc', '--test', metavar='str', type=str, help='knn, fewshot, cross-domain', default='knn')
     parser.add_argument('-b', '--backbone', metavar='str', type=str, help='conv5, resnet10|18', default='resnet10')
     parser.add_argument('-mixup', '--mixup', help='mixup in psco', action='store_true')
+    parser.add_argument('-log', '--log', metavar='str', type=str, help='log', default='')
     
+    # for scheduling
+    parser.add_argument('-e', '--epochs', metavar='int', type=int, help='epochs', default=2)
+    parser.add_argument('-lr', '--learningrate', metavar='float', type=float, help='lr', default=0.01)
+    parser.add_argument('-warmup', '--warmup', metavar='float', type=float, help='warmupepochs', default=0)
+    
+    # for fewshot
     parser.add_argument('-tr_ways', '--train_num_ways', metavar='int', type=int, help='ways', default=5)
     parser.add_argument('-ts_ways', '--test_num_ways', metavar='int', type=int, help='ways', default=5)
     parser.add_argument('-shots', '--num_shots', metavar='int', type=int, help='shots', default=5)
@@ -30,13 +35,18 @@ def parsing_argument():
     parser.add_argument('-q', '--num_queries', metavar='int', type=int, help='queries', default=15)
     parser.add_argument('-ep', '--episodes', metavar='int', type=int, help='episodes', default=100)
     
+    # for ViT
+    parser.add_argument('-img_size', '--img_size', metavar='int', type=int, help='input img size', default=84)
+    parser.add_argument('-patch_size', '--patch_size', metavar='int', type=int, help='patch size', default=6)
+    
     return parser.parse_args()
 
 def set_parameters(args, net, len_trainloader):
     if args.optimizer == 'adamW':
-        optimizer = optim.AdamW(net.parameters(), lr = args.learningrate)
-        #scheduler = WarmupCosineAnnealingScheduler(optimizer, warmup_steps=10, base_lr=args.learningrate, T_max=args.epochs)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=1e-6)
+        optimizer = optim.AdamW([{'params':net.encoder.parameters(), 'lr':args.learningrate}, {'params':net.predictor.parameters(), 'lr':args.learningrate*10}])
+        # eta_min=1e-7로 조정하기
+        scheduler = WarmupCosineAnnealingScheduler(optimizer, warmup_steps=args.warmup, base_lr=args.learningrate, T_max=args.epochs, eta_min=1e-6)
+        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=1e-6)
         #scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 40, 80, 100, 120], gamma=0.5)
     if args.optimizer == 'sgd':
         optimizer = optim.SGD(params=net.parameters(), lr=args.learningrate, weight_decay=0.0005, momentum=0.9)
@@ -86,6 +96,7 @@ import models.SSL as ssl
 import models.psco as psco
 import models.vicreg as vicreg
 import models.ijepa as ijepa
+import models.mae as mae
 import models.fewshot_models as fewshot_models
 
 def load_model(args):
@@ -102,5 +113,7 @@ def load_model(args):
     elif args.model == 'vicreg':
         net = vicreg.VICReg(args.backbone, mixup=args.mixup)
     elif args.model == 'ijepa':
-        net = ijepa.I_JEPA(num_epochs=args.epochs)
+        net = ijepa.I_JEPA(args.img_size, args.patch_size, num_epochs=args.epochs)
+    elif args.model == 'mae':
+        net = mae.MAE(args.img_size, args.patch_size)
     return net

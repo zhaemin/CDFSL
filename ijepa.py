@@ -13,15 +13,14 @@ from backbone import visiontransformer as vit
 from tqdm import tqdm
 
 from models.ijepa_utils import repeat_interleave_batch, apply_masks
+from models.mae import MIM
 
 
-class I_JEPA(nn.Module):
-    def __init__(self, num_epochs):
-        super(I_JEPA, self).__init__()
-        self.img_size = 84
-        self.patch_size = 6
-        self.num_patches = (self.img_size // self.patch_size) ** 2
-        self.encoder, self.predictor = self.load_backbone()
+class I_JEPA(MIM):
+    def __init__(self, img_size, patch_size, num_epochs):
+        super(I_JEPA, self).__init__(img_size, patch_size)
+        self.add_cls_token = True
+        self.encoder, self.predictor = self.load_backbone(encoder_add_cls_token=True, pred_add_cls_token=False)
         self.outdim = self.encoder.embed_dim
         self.target_encoder = copy.deepcopy(self.encoder)
         self.ipe = 9600
@@ -29,17 +28,8 @@ class I_JEPA(nn.Module):
         for param in self.target_encoder.parameters():
             param.requires_grad = False
         
-        self.momentum_scheduler = (0.996 + i * (1.0 - 0.996) / (self.ipe * num_epochs)
+        self.momentum_scheduler = (0.999 + i * (1.0 - 0.999) / (self.ipe * num_epochs)
                         for i in range(int(self.ipe * num_epochs) + 1))
-    
-    def load_backbone(self):
-        encoder = vit.__dict__['vit_large'](img_size=[self.img_size], patch_size=self.patch_size)
-        predictor = vit.__dict__['vit_predictor'](patch_size=6, num_patches= (self.img_size//self.patch_size) ** 2, embed_dim=encoder.embed_dim, predictor_embed_dim = encoder.embed_dim//2, num_heads=encoder.num_heads)
-        
-        #encoder = vit.vit_tiny()
-        #predictor = vit.vit_predictor()
-        
-        return encoder, predictor
     
     def forward(self, inputs, device):
         udata, masks_enc, masks_pred = inputs[0], inputs[1], inputs[2]
@@ -47,8 +37,10 @@ class I_JEPA(nn.Module):
         # momentum update of target encoder
         with torch.no_grad():
             m = next(self.momentum_scheduler)
+            #m = 0.999
             for param_q, param_k in zip(self.encoder.parameters(), self.target_encoder.parameters()):
                 param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+        
         
         def load_imgs():
             # -- unsupervised imgs
@@ -65,18 +57,23 @@ class I_JEPA(nn.Module):
                 h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim => patch 별
                 B = len(h)
                 # -- create targets (masked regions of h)
+                if self.add_cls_token:
+                    h = h[:, 1:, :]
                 h = apply_masks(h, masks_pred) #prediction할 부분 -> num_pred * B, K, D
                 h = repeat_interleave_batch(h, B, repeat=len(masks_enc)) # num_context * num_pred * B, K, D
                 return h
             
         def forward_context():
             z = self.encoder(imgs, masks_enc)
+            if self.add_cls_token:
+                z = z[:, 1:, :]
             z = self.predictor(z, masks_enc, masks_pred)
             return z
         
         h = forward_target()
         z = forward_context()
         loss = F.smooth_l1_loss(z, h)
+
         #distance = torch.pairwise_distance(h, z).view(-1, len(masks_enc) * len(masks_pred), h.size(1)) # batchsize 4 K
         #loss = torch.mean(torch.sum(distance, dim=-1))
         
@@ -84,10 +81,16 @@ class I_JEPA(nn.Module):
     
     def fewshot_acc(self, args, inputs, labels, device):
         with torch.no_grad():
+            if args.model == 'ijepa':
+                encoder = self.target_encoder
+            else:
+                encoder = self.encoder
+                
             correct = 0
             total = 0
             
-            x = torch.mean(self.target_encoder(inputs), dim=1) # B K D -> B D
+            x = torch.mean(encoder(inputs), dim=1) # B K D -> B D
+            #x = encoder(inputs)[:, 0, :] # use cls token
             batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
             x = batchnorm(x)
             
@@ -118,7 +121,11 @@ class I_JEPA(nn.Module):
             correct, total = 0, 0
             
             for x_support, x_query, y_support, y_query in tasks:
-                net = copy.deepcopy(self.target_encoder)
+                if args.model == 'ijepa':
+                    net = copy.deepcopy(self.target_encoder)
+                else:
+                    net = copy.deepcopy(self.encoder)
+                    
                 classifier = nn.Sequential(
                     nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
                     nn.Linear(self.encoder.embed_dim, args.train_num_ways)).to(device)
@@ -130,6 +137,8 @@ class I_JEPA(nn.Module):
                 with torch.no_grad():
                     shots   = torch.mean(net(x_support), dim=1)
                     queries = torch.mean(net(x_query), dim=1)
+                    #shots   = net(x_support)[:, 0, :]
+                    #queries = net(x_query)[:, 0, :]
                 for _ in range(100):
                     with torch.no_grad():
                         shots   = shots.detach()
