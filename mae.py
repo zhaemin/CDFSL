@@ -21,15 +21,31 @@ class MIM(nn.Module):
         self.patch_size = patch_size
         self.num_patches = (self.img_size // self.patch_size) ** 2
     
-    def load_backbone(self, encoder_add_cls_token=False, pred_add_cls_token=False):
+    def load_backbone(self, encoder_add_cls_token=False, pred_add_cls_token=False, setfsl=False):
         print('img_size: ',self.img_size)
         print('patch_size: ',self.patch_size)
         print('num_patches: ',self.num_patches)
         encoder = vit.__dict__['vit_small'](img_size=[self.img_size], patch_size=self.patch_size, add_cls_token=encoder_add_cls_token)
-        decoder = vit.__dict__['vit_predictor'](patch_size=self.patch_size, num_patches= (self.img_size//self.patch_size) ** 2, embed_dim=encoder.embed_dim, 
+        if setfsl:
+            decoder = vit.__dict__['vit_decoder'](self.num_patches, encoder.embed_dim, encoder.num_heads)
+        else:
+            decoder = vit.__dict__['vit_predictor'](patch_size=self.patch_size, num_patches= (self.img_size//self.patch_size) ** 2, embed_dim=encoder.embed_dim, 
                                                 predictor_embed_dim=encoder.embed_dim//2, num_heads=encoder.num_heads, add_cls_token=pred_add_cls_token)
         
         return encoder, decoder
+    
+    def attn_weighted_sum(self, x, encoder):
+        x, attn = encoder(x, return_attn=True) # use cls token
+        cls_token = x[:, 0, :]
+        patch_tokens = x[:, 1:, :]
+        attn_weights = attn.mean(axis = 1)[:, 0, 1:] # head별 mean 계산 후 cls token 분리(cls token 제외 나머지 token들에 대해) B 1 num_patches
+        attn_weights = attn_weights / attn_weights.sum(axis=-1, keepdims=True)
+        weighted_patch_tokens = torch.sum(patch_tokens * attn_weights.unsqueeze(-1), dim=1) # B N D * B N -> B D
+        
+        x = torch.cat((cls_token, weighted_patch_tokens), dim=-1)
+        x = F.normalize(x, dim=-1)
+        
+        return x
 
 
 class MAE(MIM):
@@ -81,7 +97,7 @@ class MAE(MIM):
         x = inputs
         mask, ids_restore, ids_keep = self.random_masking(x.size(0), self.num_patches, 0.75, device)
         
-        x = self.encoder(x, ids_keep)
+        x = self.encoder(x, ids_keep, return_attn=True)
         pred = self.decoder(x, ids_restore=ids_restore)
         
         target = self.patchify(inputs)
@@ -96,19 +112,25 @@ class MAE(MIM):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         
         return loss
+    
+
 
     def fewshot_acc(self, args, inputs, labels, device):
         with torch.no_grad():
             if args.model == 'ijepa':
-                encoder = copy.deepcopy(self.target_encoder)
+                encoder = self.target_encoder
             else:
-                encoder = copy.deepcopy(self.encoder)
+                encoder = self.encoder
                 
             correct = 0
             total = 0
             
-            x = torch.mean(encoder(inputs), dim=1) # B K D -> B D
-            #x = encoder(inputs)[:, 0, :] # use cls token
+            #x = torch.mean(encoder(inputs), dim=1) # B K D -> B D
+            #x = encoder(inputs)[:, 0, :]
+            
+            # attn weigted sum
+            x = self.attn_weighted_sum(inputs, encoder)
+            
             batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
             x = batchnorm(x)
             
@@ -153,10 +175,18 @@ class MAE(MIM):
                 classifier.train()
                 
                 with torch.no_grad():
-                    shots   = torch.mean(net(x_support), dim=1)
-                    queries = torch.mean(net(x_query), dim=1)
-                    #shots   = net(x_support)[:, 0, :]
-                    #queries = net(x_query)[:, 0, :]
+                    # global avg pooling
+                    #shots   = torch.mean(net(x_support), dim=1)
+                    #queries = torch.mean(net(x_query), dim=1)
+                    
+                    # attn_weighted sum
+                    #shots = self.attn_weighted_sum(x_support, net)
+                    #queries = self.attn_weighted_sum(x_query, net)
+                    
+                    # cls token
+                    shots   = net(x_support)[:, 0, :]
+                    queries = net(x_query)[:, 0, :]
+                    
                 for _ in range(100):
                     with torch.no_grad():
                         shots   = shots.detach()

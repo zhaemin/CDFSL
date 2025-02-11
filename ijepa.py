@@ -20,10 +20,12 @@ class I_JEPA(MIM):
     def __init__(self, img_size, patch_size, num_epochs):
         super(I_JEPA, self).__init__(img_size, patch_size)
         self.add_cls_token = True
-        self.encoder, self.predictor = self.load_backbone(encoder_add_cls_token=True, pred_add_cls_token=False)
+        self.encoder, self.predictor = self.load_backbone(encoder_add_cls_token=self.add_cls_token, pred_add_cls_token=False)
         self.outdim = self.encoder.embed_dim
         self.target_encoder = copy.deepcopy(self.encoder)
-        self.ipe = 9600
+        self.ipe = 150
+        
+        self.feature_weight = nn.Parameter(torch.randn(self.encoder.depth))
         
         for param in self.target_encoder.parameters():
             param.requires_grad = False
@@ -53,26 +55,35 @@ class I_JEPA(MIM):
         
         def forward_target():
             with torch.no_grad():
-                h = self.target_encoder(imgs) # B num_patches D
+                feature_lst = self.target_encoder(imgs, return_attn=False, find_optimal_target=True) # B num_patches D
+
+            feature_weight = nn.functional.softmax(self.feature_weight)
+            feature_lst = torch.stack(feature_lst) # layer B P D
+            h = torch.einsum('lbpd, l -> bpd', feature_lst, feature_weight)
+            
+            with torch.no_grad():
                 h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim => patch 별
                 B = len(h)
                 # -- create targets (masked regions of h)
                 if self.add_cls_token:
+                    target_cls_token = h[:, 0, :]
                     h = h[:, 1:, :]
                 h = apply_masks(h, masks_pred) #prediction할 부분 -> num_pred * B, K, D
                 h = repeat_interleave_batch(h, B, repeat=len(masks_enc)) # num_context * num_pred * B, K, D
-                return h
+                return h, target_cls_token
             
         def forward_context():
             z = self.encoder(imgs, masks_enc)
             if self.add_cls_token:
+                context_cls_token = z[:, 0, :]
                 z = z[:, 1:, :]
             z = self.predictor(z, masks_enc, masks_pred)
-            return z
+            return z, context_cls_token
         
-        h = forward_target()
-        z = forward_context()
-        loss = F.smooth_l1_loss(z, h)
+        h, target_cls_token = forward_target()
+        z, context_cls_token = forward_context()
+        cls_loss = F.smooth_l1_loss(target_cls_token, context_cls_token)
+        loss = F.smooth_l1_loss(z, h) + cls_loss
 
         #distance = torch.pairwise_distance(h, z).view(-1, len(masks_enc) * len(masks_pred), h.size(1)) # batchsize 4 K
         #loss = torch.mean(torch.sum(distance, dim=-1))
@@ -91,8 +102,8 @@ class I_JEPA(MIM):
             
             x = torch.mean(encoder(inputs), dim=1) # B K D -> B D
             #x = encoder(inputs)[:, 0, :] # use cls token
-            batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
-            x = batchnorm(x)
+            #batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
+            #x = batchnorm(x)
             
             tasks = split_support_query_set(x, labels, device, num_tasks=1, num_shots=args.num_shots)
             
@@ -127,18 +138,26 @@ class I_JEPA(MIM):
                     net = copy.deepcopy(self.encoder)
                     
                 classifier = nn.Sequential(
-                    nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
-                    nn.Linear(self.encoder.embed_dim, args.train_num_ways)).to(device)
+                    #nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
+                    nn.Linear(self.encoder.embed_dim*2, args.train_num_ways)).to(device)
                 optimizer = optim.SGD(classifier.parameters(), lr=0.01, momentum=0.9, weight_decay=0.001)
                 
                 net.eval()
                 classifier.train()
                 
                 with torch.no_grad():
-                    shots   = torch.mean(net(x_support), dim=1)
-                    queries = torch.mean(net(x_query), dim=1)
+                    # global avg pooling
+                    #shots   = torch.mean(net(x_support), dim=1)
+                    #queries = torch.mean(net(x_query), dim=1)
+                    
+                    # attn_weighted sum
+                    shots = self.attn_weighted_sum(x_support, net)
+                    queries = self.attn_weighted_sum(x_query, net)
+                    
+                    # cls token
                     #shots   = net(x_support)[:, 0, :]
                     #queries = net(x_query)[:, 0, :]
+                    
                 for _ in range(100):
                     with torch.no_grad():
                         shots   = shots.detach()

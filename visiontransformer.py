@@ -70,6 +70,10 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -83,6 +87,23 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, attn
+    
+    def forward_qkv(self, q, k, v):
+        B, N, C = q.shape
+        
+        q = self.q(q)
+        k = self.k(k)
+        v = self.v(v)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+        
 
 
 class Block(nn.Module):
@@ -99,10 +120,10 @@ class Block(nn.Module):
 
     def forward(self, x, return_attention=False):
         y, attn = self.attn(self.norm1(x))
-        if return_attention:
-            return attn
         x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if return_attention:
+            return x, attn
         return x
 
 
@@ -152,6 +173,48 @@ class ConvEmbed(nn.Module):
         p = self.stem(x)
         return p.flatten(2).transpose(1, 2)
 
+class VisionTransformerDecoder(nn.Module):
+    def __init__(self, num_patches, embed_dim, num_heads):
+        super().__init__()
+        self.attention1 = Attention(embed_dim, num_heads=num_heads)
+        self.attention2 = Attention(embed_dim, num_heads=num_heads)
+        self.norm1  = nn.LayerNorm(embed_dim)
+        self.norm2  = nn.LayerNorm(embed_dim)
+        self.norm3  = nn.LayerNorm(embed_dim)
+        self.mlp = MLP(embed_dim, embed_dim*4)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches+1, embed_dim), requires_grad=False)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(num_patches**.5), cls_token=True)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        
+        self.projection = nn.Linear(embed_dim, 1)
+    
+    def forward(self, query_pos, memories):
+        bs = memories.size(0)
+        query_pos = query_pos.unsqueeze(1).repeat(1, bs, 1) # object bs dim
+        x = torch.zeros_like(query_pos)
+        
+        q = k = x + query_pos
+        x2 = self.attention1.forward_qkv(q, k, x)
+        x = x + x2
+        x = self.norm1(x)
+        
+        q = x + query_pos # object bs dim
+        k = memories + self.pos_embed # bs p dim
+        v = memories # bs p dim
+        q = q.transpose(0, 1) # bs object dim
+        x2 = self.attention2.forward_qkv(q, k, v).transpose(0, 1) # object bs dim
+        x = x + x2
+        x = self.norm2(x)
+        
+        x = self.mlp(x)
+        x = self.norm3(x)
+        
+        # object가 존재하는지 나타냄
+        x = self.projection(x).squeeze(-1)
+        
+        return x  
+        
 
 class VisionTransformerPredictor(nn.Module):
     """ Vision Transformer """
@@ -201,6 +264,8 @@ class VisionTransformerPredictor(nn.Module):
         trunc_normal_(self.mask_token, std=self.init_std)
         self.apply(self._init_weights)
         self.fix_init_weight()
+        # --
+        
 
     def fix_init_weight(self):
         def rescale(param, layer_id):
@@ -225,11 +290,11 @@ class VisionTransformerPredictor(nn.Module):
     
     def forward(self, x, masks_x=None, masks=None, ids_restore=None):
         if ids_restore == None:
-            return self.forward_predictor(x, masks_x, masks)
+            return self.forward_ijepa_predictor(x, masks_x, masks)
         else:
-            return self.forward_decoder(x, ids_restore)
+            return self.forward_mae_decoder(x, ids_restore)
     
-    def forward_decoder(self, x, ids_restore):
+    def forward_mae_decoder(self, x, ids_restore):
         # embed tokens
         x = self.predictor_embed(x)
         
@@ -260,9 +325,11 @@ class VisionTransformerPredictor(nn.Module):
         
         return x
 
-    def forward_predictor(self, x, masks_x, masks): # x=encoder를 통과한 context, masks_x = mask_enc, masks = mask_pred
+    def forward_ijepa_predictor(self, x, masks_x, masks): # x=encoder를 통과한 context, masks_x = mask_enc, masks = mask_pred
         assert (masks is not None) and (masks_x is not None), 'Cannot run predictor without mask indices'
         
+        if self.add_cls_token:
+            x = x[:, 1:, :] # cls token 제외
         if not isinstance(masks_x, list):
             masks_x = [masks_x]
             
@@ -312,9 +379,7 @@ class VisionTransformer(nn.Module):
         patch_size=16,
         in_chans=3,
         embed_dim=768,
-        predictor_embed_dim=384,
         depth=12,
-        predictor_depth=12,
         num_heads=12,
         mlp_ratio=4.0,
         qkv_bias=True,
@@ -331,6 +396,7 @@ class VisionTransformer(nn.Module):
         self.num_features = self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.add_cls_token = add_cls_token
+        self.depth = depth
         # --
         self.patch_embed = PatchEmbed(
             img_size=img_size[0],
@@ -380,7 +446,7 @@ class VisionTransformer(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, masks=None):
+    def forward(self, x, masks=None, return_attn=False, find_optimal_target=False):
         if masks is not None:
             if not isinstance(masks, list):
                 masks = [masks]
@@ -388,10 +454,11 @@ class VisionTransformer(nn.Module):
         # -- patchify x
         x = self.patch_embed(x)
         B, N, D = x.shape
-        
+
         # -- add positional embedding to x
         if self.add_cls_token:
-            x = x + pos_embed[:, 1, :]
+            pos_embed = self.pos_embed
+            x = x + pos_embed[:, 1:, :]
         else:
             pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
             x = x + pos_embed
@@ -406,13 +473,28 @@ class VisionTransformer(nn.Module):
             x = torch.cat((cls_tokens, x), dim=1)
         
         # -- fwd prop
+        attn = None
+        feature_lst = []
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
-        
+            if i == self.depth-1: # last layer
+                if return_attn:
+                    x, attn = blk(x, return_attention=return_attn)
+                else:
+                    x = blk(x)
+            else:
+                x = blk(x)
+            if find_optimal_target:
+                feature_lst.append(x)
+            
         if self.norm is not None:
             x = self.norm(x)
         
-        return x
+        if find_optimal_target:
+            return feature_lst
+        elif return_attn:
+            return x, attn
+        else:
+            return x
 
     def interpolate_pos_encoding(self, x, pos_embed): # 인수로 들어온 num patches(position embedding)과 실제 num patches가 다를 때 pos_embed를 interpolate
         npatch = x.shape[1] - 1
@@ -433,13 +515,25 @@ class VisionTransformer(nn.Module):
 
 def vit_predictor(**kwargs):
     model = VisionTransformerPredictor(
-        mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
         **kwargs)
+    return model
+
+def vit_decoder(num_patches, embed_dim, num_heads):
+    model = VisionTransformerDecoder(num_patches, embed_dim, num_heads)
+    return model
+
+def vit_mini(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        #embed_dim=192
+        patch_size=patch_size, embed_dim=96, depth=12, num_heads=3, mlp_ratio=4,
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
 def vit_tiny(patch_size=16, **kwargs):
     model = VisionTransformer(
+        #embed_dim=192
         patch_size=patch_size, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4,
         qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
@@ -462,14 +556,15 @@ def vit_base(patch_size=16, **kwargs):
 def vit_large(patch_size=16, **kwargs):
     model = VisionTransformer(
         # change embed dim -> original : 1024
-        patch_size=patch_size, embed_dim=192, depth=24, num_heads=16, mlp_ratio=4,
+        patch_size=patch_size, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4,
         qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
 def vit_huge(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4,
+        #org: 1280 
+        patch_size=patch_size, embed_dim=96, depth=32, num_heads=16, mlp_ratio=4,
         qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
