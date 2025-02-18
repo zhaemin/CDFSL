@@ -57,6 +57,37 @@ class MLP(nn.Module):
         x = self.drop(x)
         return x
 
+class Attention_QKV(nn.Module):
+    def __init__(self, dim, num_heads=1, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+    
+        self.attn_drop = nn.Dropout(attn_drop)
+        #self.proj = nn.Linear(dim, dim)
+        #self.proj_drop = nn.Dropout(proj_drop)
+        
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        #self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        
+    def forward_qkv(self, q, k, v):
+        B, N, C = q.shape
+        
+        q = self.q(q)
+        k = self.k(k)
+        #v = self.v(v)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale # bs object p
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        #x = self.proj(x)
+        #x = self.proj_drop(x)
+        return x, attn
+
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -69,10 +100,6 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v = nn.Linear(dim, dim, bias=qkv_bias)
         
     def forward(self, x):
         B, N, C = x.shape
@@ -87,23 +114,6 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, attn
-    
-    def forward_qkv(self, q, k, v):
-        B, N, C = q.shape
-        
-        q = self.q(q)
-        k = self.k(k)
-        v = self.v(v)
-        
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-        
 
 
 class Block(nn.Module):
@@ -174,10 +184,10 @@ class ConvEmbed(nn.Module):
         return p.flatten(2).transpose(1, 2)
 
 class VisionTransformerDecoder(nn.Module):
-    def __init__(self, num_patches, embed_dim, num_heads):
+    def __init__(self, num_patches, embed_dim, num_heads=1):
         super().__init__()
-        self.attention1 = Attention(embed_dim, num_heads=num_heads)
-        self.attention2 = Attention(embed_dim, num_heads=num_heads)
+        self.attention1 = Attention_QKV(embed_dim, num_heads)
+        self.attention2 = Attention_QKV(embed_dim, num_heads)
         self.norm1  = nn.LayerNorm(embed_dim)
         self.norm2  = nn.LayerNorm(embed_dim)
         self.norm3  = nn.LayerNorm(embed_dim)
@@ -187,33 +197,36 @@ class VisionTransformerDecoder(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(num_patches**.5), cls_token=True)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         
-        self.projection = nn.Linear(embed_dim, 1)
+        #self.projection = nn.Linear(embed_dim, 1)
     
     def forward(self, query_pos, memories):
         bs = memories.size(0)
         query_pos = query_pos.unsqueeze(1).repeat(1, bs, 1) # object bs dim
         x = torch.zeros_like(query_pos)
         
+        '''
         q = k = x + query_pos
         x2 = self.attention1.forward_qkv(q, k, x)
         x = x + x2
         x = self.norm1(x)
+        '''
         
         q = x + query_pos # object bs dim
         k = memories + self.pos_embed # bs p dim
         v = memories # bs p dim
         q = q.transpose(0, 1) # bs object dim
-        x2 = self.attention2.forward_qkv(q, k, v).transpose(0, 1) # object bs dim
-        x = x + x2
+        x2, qk_attn = self.attention2.forward_qkv(q, k, v)
+        x2 = x2.transpose(0, 1) # object bs dim
+        x = x + x2 
         x = self.norm2(x)
         
         x = self.mlp(x)
-        x = self.norm3(x)
+        #x = self.norm3(x)
         
         # object가 존재하는지 나타냄
-        x = self.projection(x).squeeze(-1)
+        #x = self.projection(x).squeeze(-1)
         
-        return x  
+        return x, qk_attn  # object bs dim
         
 
 class VisionTransformerPredictor(nn.Module):

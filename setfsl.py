@@ -11,7 +11,6 @@ from utils import split_support_query_set
 from backbone import visiontransformer as vit
 
 from tqdm import tqdm
-
 from models.mae import MIM
 
 
@@ -24,55 +23,69 @@ class SET_FSL(MIM):
         self.num_objects = 10
         
         self.query_pos = nn.Embedding(self.num_objects, self.encoder.embed_dim)
-        # binary로도 설정해보기 -> 이진수 변환
-        numbers = torch.arange(0, 2**self.num_objects)
-        self.binary = torch.tensor([[int(b) for b in f"{i:010b}"] for i in numbers], requires_grad=False).float().cuda() # 1024 10
         
-        '''
         for param in self.encoder.parameters():
             param.requires_grad = False
-        '''
+            
         
-    
-    def forward(self, inputs, device):
+    def forward(self, inputs, labels, device):
         # inputs = [batchsize*2, 3, h, w]
         
         with torch.no_grad():
-            z = self.encoder(inputs)
-        z = self.decoder(self.query_pos.weight, z) # object bs*2
-        z = z.transpose(0, 1) # bs*2 object
-        x, y = torch.chunk(z, 2) # split to x, y
-        x = F.normalize(x)
-        y = F.normalize(y)
+            z, encoder_attn = self.encoder(inputs, return_attn=True)
+        encoder_attn = F.normalize(encoder_attn.mean(axis = 1)[:, 0, 1:]).unsqueeze(dim=-2) #bs 1 numpatches
+        z, decoder_attn = self.decoder(self.query_pos.weight, z) # object samples dim / attn(query의 각 object가 어디에 집중) -> bs object patches+1
         
-        # bs object
-        p_x = F.log_softmax(x @ self.binary.T, dim=0) # bs 1024
-        p_y = F.log_softmax(y @ self.binary.T, dim=0)
+        decoder_attn = F.normalize(decoder_attn.mean(axis = 1)[:, 1:]).unsqueeze(dim=-1) # object들의 mean을 구함, cls token 제외 -> bs numpatches 1
+        attn_dist = torch.einsum('bep, bpd -> bed', encoder_attn, decoder_attn).mean()
         
-        loss = F.l1_loss(p_x, p_y)
-
-        return loss
-
+        z = z.transpose(0, 1) # samples object dim
+        tasks = split_support_query_set(z, labels, device, num_tasks=1, num_shots=5)
+        
+        loss = 0
+        for x_support, x_query, y_support, y_query in tasks:
+            prototypes = torch.mean(x_support.view(5, -1, self.num_objects, self.outdim), dim=1)
+            prototypes = F.normalize(prototypes, dim=1)
+            x_query = F.normalize(x_query, dim=1)
+            
+            x_query = x_query.unsqueeze(1).repeat(1, prototypes.size(0), 1, 1).unsqueeze(-2) # queries num_ways objects 1 dim
+            prototypes = prototypes.unsqueeze(0).repeat(x_query.size(0), 1, 1, 1).unsqueeze(-1) # queries num_ways objects dim 1
+            distance = (x_query @ prototypes).squeeze() # queries num_ways objects
+            #distance = torch.einsum('qad, pbd -> qpab', x_query, prototypes).reshape(x_query.size(0), 5, -1)# 75 5 10 10
+            logits = torch.sum(distance, dim=-1) # queries num_ways
+            
+            loss += F.cross_entropy(logits, y_query)
+            
+        return 0.2 * loss + 0.8 * attn_dist
+    
     def fewshot_acc(self, args, inputs, labels, device):
         with torch.no_grad():
-            encoder = self.encoder
-                
             correct = 0
             total = 0
             
-            x = torch.mean(encoder(inputs), dim=1) # B K D -> B D
-            #x = encoder(inputs)[:, 0, :] # use cls token
-            #batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
-            #x = batchnorm(x)
+            z, encoder_attn = self.encoder(inputs, return_attn=True)
+            cls_token = z[:, 0, :].unsqueeze(1)
+            z, decoder_attn = self.decoder(self.query_pos.weight, z) # object samples dim / attn(query의 각 object가 어디에 집중) -> bs object patches+1
             
-            tasks = split_support_query_set(x, labels, device, num_tasks=1, num_shots=args.num_shots)
+            z = z.transpose(0, 1) # samples object dim
+            z = torch.concat((cls_token, z), dim=1)
+            tasks = split_support_query_set(z, labels, device, num_tasks=1, num_shots=5)
             
             for x_support, x_query, y_support, y_query in tasks:
-                x_support = F.normalize(x_support)
-                x_query = F.normalize(x_query) # q d
-                prototypes = F.normalize(torch.sum(x_support.view(5, args.num_shots, -1), dim=1), dim=1) # 5 d
+                prototypes = torch.mean(x_support.view(5, -1, self.num_objects+1, self.outdim), dim=1)
+                prototypes = F.normalize(prototypes, dim=1)
+                x_query = F.normalize(x_query, dim=1)
                 
-                logits = torch.einsum('qd, wd -> qw', x_query, prototypes)
+                x_query = x_query.unsqueeze(1).repeat(1, prototypes.size(0), 1, 1).unsqueeze(-2) # queries num_ways objects 1 dim
+                prototypes = prototypes.unsqueeze(0).repeat(x_query.size(0), 1, 1, 1).unsqueeze(-1) # queries num_ways objects dim 1
+                distance = (x_query @ prototypes).squeeze() # queries num_ways objects
+                
+                cls_distance = distance[:, :, 0]
+                object_distance = distance[:, :, 1:].sum(dim=-1)
+                #distance = torch.einsum('qad, pbd -> qpab', x_query, prototypes).reshape(x_query.size(0), 5, -1) # 75 5 10 10
+                #logits = 0.5 * cls_distance + 0.5 * object_distance
+                logits = object_distance
+                
                 _, predicted = torch.max(logits.data, 1)
                 correct += (predicted == y_query).sum().item()
                 total += y_query.size(0)
@@ -88,37 +101,32 @@ class SET_FSL(MIM):
             inputs, labels = data
             inputs, labels = inputs.to(device), labels.to(device)
             
-            tasks = split_support_query_set(inputs, labels, device, num_tasks=1, num_shots=args.num_shots)
+            with torch.no_grad():
+                z, encoder_attn = self.encoder(inputs, return_attn=True)
+                z, decoder_attn = self.decoder(self.query_pos.weight, z) # object samples dim / attn(query의 각 object가 어디에 집중) -> bs object patches+1
+                
+                z = z.transpose(0, 1) # samples object dim
+                z = z.sum(dim=1)
+            
+            tasks = split_support_query_set(z, labels, device, num_tasks=1, num_shots=args.num_shots)
             correct, total = 0, 0
             
             for x_support, x_query, y_support, y_query in tasks:
-                net = copy.deepcopy(self.encoder)
+                #net = copy.deepcopy(self.encoder)
                     
                 classifier = nn.Sequential(
                     #nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
-                    nn.Linear(self.encoder.embed_dim*2, args.train_num_ways)).to(device)
+                    nn.Linear(self.encoder.embed_dim, args.train_num_ways)).to(device)
                 optimizer = optim.SGD(classifier.parameters(), lr=0.01, momentum=0.9, weight_decay=0.001)
                 
-                net.eval()
+                self.encoder.eval()
+                self.decoder.eval()
                 classifier.train()
-                
-                with torch.no_grad():
-                    # global avg pooling
-                    #shots   = torch.mean(net(x_support), dim=1)
-                    #queries = torch.mean(net(x_query), dim=1)
-                    
-                    # attn_weighted sum
-                    shots = self.attn_weighted_sum(x_support, net)
-                    queries = self.attn_weighted_sum(x_query, net)
-                    
-                    # cls token
-                    #shots   = net(x_support)[:, 0, :]
-                    #queries = net(x_query)[:, 0, :]
                     
                 for _ in range(100):
                     with torch.no_grad():
-                        shots   = shots.detach()
-                        queries = queries.detach()
+                        shots   = x_support.detach()
+                        queries = x_query.detach()
                         
                     rand_id = np.random.permutation(args.train_num_ways * args.num_shots)
                     batch_indices = [rand_id[i*4:(i+1)*4] for i in range(rand_id.size//4)]
@@ -132,7 +140,6 @@ class SET_FSL(MIM):
                         loss.backward()
                         optimizer.step()
                 
-                net.eval()
                 classifier.eval()
                 
                 with torch.no_grad():
@@ -146,6 +153,7 @@ class SET_FSL(MIM):
             
         accuracy = total_acc / len(loader)
         return accuracy
+    
 '''
     
     def fewshot_acc(self, args, inputs, labels, device):
