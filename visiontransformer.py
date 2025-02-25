@@ -57,37 +57,6 @@ class MLP(nn.Module):
         x = self.drop(x)
         return x
 
-class Attention_QKV(nn.Module):
-    def __init__(self, dim, num_heads=1, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-    
-        self.attn_drop = nn.Dropout(attn_drop)
-        #self.proj = nn.Linear(dim, dim)
-        #self.proj_drop = nn.Dropout(proj_drop)
-        
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k = nn.Linear(dim, dim, bias=qkv_bias)
-        #self.v = nn.Linear(dim, dim, bias=qkv_bias)
-        
-    def forward_qkv(self, q, k, v):
-        B, N, C = q.shape
-        
-        q = self.q(q)
-        k = self.k(k)
-        #v = self.v(v)
-        
-        attn = (q @ k.transpose(-2, -1)) * self.scale # bs object p
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        #x = self.proj(x)
-        #x = self.proj_drop(x)
-        return x, attn
-
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -183,50 +152,107 @@ class ConvEmbed(nn.Module):
         p = self.stem(x)
         return p.flatten(2).transpose(1, 2)
 
+
+class Attention_QKV(nn.Module):
+    def __init__(self, dim, num_heads=1, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+    
+        self.attn_drop = nn.Dropout(attn_drop)
+        
+        self.proj = nn.Linear(dim, dim, bias=False) # 이 projection weight 0으로 만들기
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.init_proj_weight()
+        
+        #self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        #self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        #self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.q = nn.Identity()
+        self.k = nn.Identity()
+        self.v = nn.Identity()
+    
+    def init_proj_weight(self):
+        nn.init.zeros_(self.proj.weight)
+        '''
+        for param in self.proj.parameters():
+            param.requires_grad = False
+        '''
+        
+    def forward(self, q, k, v):
+        B, N, C = q.shape
+        
+        q = self.q(q)
+        k = self.k(k)
+        v = self.v(v)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale # bs object p
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
+        #self.init_proj_weight()
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    
 class VisionTransformerDecoder(nn.Module):
     def __init__(self, num_patches, embed_dim, num_heads=1):
         super().__init__()
-        self.attention1 = Attention_QKV(embed_dim, num_heads)
-        self.attention2 = Attention_QKV(embed_dim, num_heads)
-        self.norm1  = nn.LayerNorm(embed_dim)
-        self.norm2  = nn.LayerNorm(embed_dim)
-        self.norm3  = nn.LayerNorm(embed_dim)
+        self.attention = Attention_QKV(embed_dim, num_heads)
+        self.norm  = nn.LayerNorm(embed_dim)
         self.mlp = MLP(embed_dim, embed_dim*4)
 
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches+1, embed_dim), requires_grad=False)
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(num_patches**.5), cls_token=True)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         
-        #self.projection = nn.Linear(embed_dim, 1)
+        self.weight_for_blk = nn.Parameter(torch.ones(12, requires_grad=True))
     
-    def forward(self, query_pos, memories):
-        bs = memories.size(0)
-        query_pos = query_pos.unsqueeze(1).repeat(1, bs, 1) # object bs dim
-        x = torch.zeros_like(query_pos)
+    def forward(self, query_pos, memories, attn):
+        bs = memories[0].size(0)
+        num_objects = query_pos.size(0)
+        query_pos = query_pos.unsqueeze(0).repeat(bs, 1, 1) # bs object dim
+        object_queries = torch.zeros_like(query_pos)
+        object_queries = object_queries + query_pos
         
-        '''
-        q = k = x + query_pos
-        x2 = self.attention1.forward_qkv(q, k, x)
-        x = x + x2
-        x = self.norm1(x)
-        '''
+        last_feature = memories[-1]
+        x1 = torch.concat((object_queries, last_feature), dim=1)
         
-        q = x + query_pos # object bs dim
-        k = memories + self.pos_embed # bs p dim
-        v = memories # bs p dim
-        q = q.transpose(0, 1) # bs object dim
-        x2, qk_attn = self.attention2.forward_qkv(q, k, v)
-        x2 = x2.transpose(0, 1) # object bs dim
-        x = x + x2 
-        x = self.norm2(x)
+        if attn == 'selfattn':
+            # self - attention
+            x2 = self.attention(x1, x1, x1)
+        else:
+            # cross - attention
+            q = object_queries
+            k = last_feature
+            
+            # using last feature
+            #v  = last_feature
+            
+            # feature aggregation
+            #weight_for_blk = nn.functional.softmax(self.weight_for_blk, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            #memories = torch.mul(memories, weight_for_blk)
+            #v = memories.sum(dim=0)
+            
+            # using layer 6
+            v = memories[6]
+            
+            x2 = self.attention(q, k, v)
+            x2 = torch.concat((x2, torch.zeros_like(last_feature)), dim=1)
         
-        x = self.mlp(x)
-        #x = self.norm3(x)
+        x  = x1 + x2
         
-        # object가 존재하는지 나타냄
-        #x = self.projection(x).squeeze(-1)
+        x = self.norm(x[:, :num_objects+1, :]) # only cls token + object tokens
+        #x = self.norm(x[:, num_objects, :]).unsqueeze(1) # only cls token
+        #x = self.norm(x[:, :num_objects, :]) # only obj
         
-        return x, qk_attn  # object bs dim
+        #x = x[:, :num_objects+1, :]
+        
+        return x
         
 
 class VisionTransformerPredictor(nn.Module):
@@ -433,10 +459,16 @@ class VisionTransformer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
+        
+        
+        # feature aggregation
+        #self.blk_mix = nn.Linear(embed_dim, embed_dim, bias=False)
+        
         # ------
         self.init_std = init_std
         self.apply(self._init_weights)
         self.fix_init_weight()
+    
 
     def fix_init_weight(self):
         def rescale(param, layer_id):
@@ -488,6 +520,7 @@ class VisionTransformer(nn.Module):
         # -- fwd prop
         attn = None
         feature_lst = []
+        
         for i, blk in enumerate(self.blocks):
             if i == self.depth-1: # last layer
                 if return_attn:
@@ -498,11 +531,12 @@ class VisionTransformer(nn.Module):
                 x = blk(x)
             if find_optimal_target:
                 feature_lst.append(x)
-            
+        
         if self.norm is not None:
             x = self.norm(x)
         
         if find_optimal_target:
+            feature_lst = torch.stack(feature_lst)
             return feature_lst
         elif return_attn:
             return x, attn
