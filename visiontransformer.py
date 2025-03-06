@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 
-from models.ijepa_utils import trunc_normal_, repeat_interleave_batch, apply_masks
+from models.vit_utils import trunc_normal_, repeat_interleave_batch, apply_masks
 from backbone.pos_embed import get_2d_sincos_pos_embed
 
 
@@ -162,9 +162,10 @@ class Attention_QKV(nn.Module):
     
         self.attn_drop = nn.Dropout(attn_drop)
         
-        self.proj = nn.Linear(dim, dim, bias=False) # 이 projection weight 0으로 만들기
+        #self.proj = nn.Linear(dim, dim, bias=False) # 이 projection weight 0으로 만들기
+        self.proj = nn.Identity()
         self.proj_drop = nn.Dropout(proj_drop)
-        self.init_proj_weight()
+        #self.init_proj_weight()
         
         #self.q = nn.Linear(dim, dim, bias=qkv_bias)
         #self.k = nn.Linear(dim, dim, bias=qkv_bias)
@@ -211,38 +212,29 @@ class VisionTransformerDecoder(nn.Module):
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         
         self.weight_for_blk = nn.Parameter(torch.ones(12, requires_grad=True))
-    
-    def forward(self, query_pos, memories, attn):
+        
+        
+    def forward(self, query_pos, memories, attn, layer):
         bs = memories[0].size(0)
         num_objects = query_pos.size(0)
         query_pos = query_pos.unsqueeze(0).repeat(bs, 1, 1) # bs object dim
         object_queries = torch.zeros_like(query_pos)
         object_queries = object_queries + query_pos
         
-        last_feature = memories[-1]
-        x1 = torch.concat((object_queries, last_feature), dim=1)
+        cls_token = memories[layer][:, 0, :].unsqueeze(1)
+        x1 = torch.concat((object_queries, cls_token), dim=1)
         
         if attn == 'selfattn':
             # self - attention
             x2 = self.attention(x1, x1, x1)
         else:
             # cross - attention
-            q = object_queries
-            k = last_feature
-            
-            # using last feature
-            #v  = last_feature
-            
-            # feature aggregation
-            #weight_for_blk = nn.functional.softmax(self.weight_for_blk, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            #memories = torch.mul(memories, weight_for_blk)
-            #v = memories.sum(dim=0)
-            
-            # using layer 6
-            v = memories[6]
+            q = query_pos
+            k = memories[layer]
+            v = memories[layer]
             
             x2 = self.attention(q, k, v)
-            x2 = torch.concat((x2, torch.zeros_like(last_feature)), dim=1)
+            x2 = torch.concat((x2, torch.zeros_like(cls_token)), dim=1)
         
         x  = x1 + x2
         
@@ -250,10 +242,36 @@ class VisionTransformerDecoder(nn.Module):
         #x = self.norm(x[:, num_objects, :]).unsqueeze(1) # only cls token
         #x = self.norm(x[:, :num_objects, :]) # only obj
         
-        #x = x[:, :num_objects+1, :]
+        return x
+
+'''
+    def forward(self, query_pos, memories, attn, layer):
+        bs = memories[0].size(0)
+        num_objects = query_pos.size(0)
+        query_pos = query_pos.unsqueeze(0).repeat(bs, 1, 1) # bs object dim
+        object_queries = torch.zeros_like(query_pos)
+        object_queries = object_queries + query_pos
+        
+        cls_token_shape = torch.zeros_like(memories[layer][:, 0, :].unsqueeze(1))
+        #x1 = torch.concat((object_queries, cls_token), dim=1)
+        
+        layers = [2, 5, 8, 11]
+        for i, l in enumerate(layers):
+            # cross - attention
+            q = query_pos
+            k = memories[l]
+            v = memories[l]
+            
+            x = self.attention(q, k, v)
+            query_pos = query_pos + x
+            
+            if i == len(layers)-1:
+                x = torch.concat((x, memories[l][:, 0, :].unsqueeze(1)), dim=1)
+        
+        x = self.norm(x[:, :num_objects+1, :]) # only cls token + object tokens
         
         return x
-        
+'''
 
 class VisionTransformerPredictor(nn.Module):
     """ Vision Transformer """
