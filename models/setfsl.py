@@ -28,7 +28,7 @@ class CrossAttention(nn.Module):
         return z
 
 class SET_FSL(nn.Module):
-    def __init__(self, img_size, patch_size, num_objects, temperature, layer, with_cls=False, splitlayers=-1, train_w_qkv=False, train_w_o=False):
+    def __init__(self, img_size, patch_size, num_objects, temperature, layer, with_cls=False, continual_layers=None, train_w_qkv=False, train_w_o=False):
         super(SET_FSL, self).__init__()
         self.img_size = img_size
         self.patch_size = patch_size
@@ -40,7 +40,7 @@ class SET_FSL(nn.Module):
         self.num_objects = num_objects
         self.temperature = temperature
         self.with_cls = with_cls
-        self.splitlayers = splitlayers
+        self.continual_layers = continual_layers
         self.train_w_qkv = train_w_qkv
         self.train_w_o = train_w_o
         
@@ -51,9 +51,9 @@ class SET_FSL(nn.Module):
         self.norm2 = nn.LayerNorm(self.outdim)
         self.crossattn = CrossAttention(self.outdim)
         
-        if splitlayers != -1:
-            self.ca_blocks = nn.ModuleList([CrossAttention(self.outdim) for i in range(self.encoder.depth // splitlayers)])
-            self.layer_nums = [x for x in range(self.encoder.depth) if ((x+1) % (self.encoder.depth // splitlayers) == 0)]
+        if continual_layers != None:
+            self.ca_blocks = nn.ModuleList([CrossAttention(self.outdim) for i in range(len(continual_layers))])
+            self.layer_nums = continual_layers
             print(*self.layer_nums)
         
         for name, param in self.encoder.named_parameters():
@@ -113,7 +113,7 @@ class SET_FSL(nn.Module):
         
         cls_token = z[self.layer][:, 0, :].unsqueeze(1)
         
-        if self.splitlayers == -1:
+        if self.continual_layers == None:
             # test 1
             z = self.individual_crossattn(z)
         else:
@@ -154,10 +154,8 @@ class SET_FSL(nn.Module):
             
             cls_token = z[self.layer][:, 0, :].unsqueeze(1)
             
-            if self.splitlayers == -1:
-                q = self.object_queries.weight
-                kv = z[self.layer]
-                z = self.crossattn(q, kv)
+            if self.continual_layers == None:
+                z = self.individual_crossattn(z)
             else:
                 z = self.continual_crossattn(z)
             z = self.norm2(z)
