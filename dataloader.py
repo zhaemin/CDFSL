@@ -139,8 +139,8 @@ def load_dataset(args, dataset):
         trainset = torchvision.datasets.CIFAR10(root = '../data/cifar10', train=True, download=True, transform=ssltransform)
         testset = torchvision.datasets.CIFAR10(root = '../data/cifar10', train=False, download=True, transform=transform_test)
         
-        trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2)
-        testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, drop_last=True, num_workers=2)
+        trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=8)
+        testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, drop_last=True, num_workers=8)
         valloader = None
         
         num_classes = 10
@@ -168,7 +168,7 @@ def load_dataset(args, dataset):
             
         testset_labels = torch.LongTensor(testset.targets)
         test_sampler = FewShotSampler(testset_labels, args.test_num_ways, args.num_shots, args.num_queries, 600, num_tasks=1)
-        testloader = DataLoader(testset, batch_sampler=test_sampler, pin_memory=True, num_workers=10)
+        testloader = DataLoader(testset, batch_sampler=test_sampler, pin_memory=True, num_workers=8)
     
     return trainloader, testloader, valloader, num_classes
 
@@ -203,7 +203,7 @@ def load_ssl_data(args):
     test_sampler = FewShotSampler(testset_labels, args.test_num_ways, args.num_shots, args.num_queries, 600, num_tasks=1)
     val_sampler = FewShotSampler(valset_labels, args.test_num_ways, args.num_shots, args.num_queries, 100, num_tasks=1)
     
-    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True)
+    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=8, pin_memory=True)
     valloader = DataLoader(valset, batch_sampler=val_sampler, pin_memory=True)
     
     if args.test == 'fewshot' or args.test == 'crossdomain':
@@ -238,13 +238,13 @@ def load_ijepa_data(args):
     val_sampler = FewShotSampler(valset_labels, args.test_num_ways, args.num_shots, args.num_queries, 100, num_tasks=1)
     
     mask_collator = MBMaskCollator(input_size=(args.img_size, args.img_size), patch_size=args.patch_size, allow_overlap=False)
-    trainloader = DataLoader(trainset, batch_size=args.batch_size, collate_fn=mask_collator, shuffle=True, drop_last=True, num_workers=10, pin_memory=True)
+    trainloader = DataLoader(trainset, batch_size=args.batch_size, collate_fn=mask_collator, shuffle=True, drop_last=True, num_workers=8, pin_memory=True)
     valloader = DataLoader(valset, batch_sampler=val_sampler, pin_memory=True)
     
     if args.test == 'fewshot' or args.test == 'crossdomain':
-        testloader = DataLoader(testset, batch_sampler=test_sampler, pin_memory=True, num_workers=10)
+        testloader = DataLoader(testset, batch_sampler=test_sampler, pin_memory=True, num_workers=8)
     else:
-        testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, drop_last=True, num_workers=10)
+        testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, drop_last=True, num_workers=8)
     
     return trainloader, testloader, valloader, num_classes
 
@@ -263,10 +263,10 @@ def load_setfsl_data(args):
     
     trainset = torchvision.datasets.ImageFolder(root='../data/fewshotdata/miniimagenet/data/train', transform=transform_train)
     testset = torchvision.datasets.ImageFolder(root='../data/fewshotdata/miniimagenet/data/test', transform=transform_test)
-    #valset = torchvision.datasets.ImageFolder(root='../data/fewshotdata/miniimagenet/data/val', transform=transform_test)
+    valset = torchvision.datasets.ImageFolder(root='../data/fewshotdata/miniimagenet/data/val', transform=transform_test)
     num_classes = 64
     
-    valset = cd_dataset.load_crossdomain_dataset('CropDisease', transform_test)
+    #valset = cd_dataset.load_crossdomain_dataset('CropDisease', transform_test)
     
     trainset_labels = torch.LongTensor(trainset.targets)
     testset_labels = torch.LongTensor(testset.targets)
@@ -280,9 +280,9 @@ def load_setfsl_data(args):
     valloader = DataLoader(valset, batch_sampler=val_sampler, num_workers=10, pin_memory=True)
     
     if args.test == 'fewshot' or args.test == 'crossdomain':
-        testloader = DataLoader(testset, batch_sampler=test_sampler, num_workers=10, pin_memory=True)
+        testloader = DataLoader(testset, batch_sampler=test_sampler, num_workers=8, pin_memory=True)
     else:
-        testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, drop_last=True, num_workers=10)
+        testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, drop_last=True, num_workers=8)
     
     return trainloader, testloader, valloader, num_classes
 

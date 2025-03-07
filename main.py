@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import datetime
 import torch.nn.utils as utils
 import torch.optim as optim
+from tqdm import tqdm
 
 import dataloader
 
@@ -29,7 +30,10 @@ def train_per_epoch(args, dataloader, net, optimizer, scheduler, device):
                 inputs = torch.stack(inputs)
             inputs, labels = inputs.to(device), labels.to(device)
         
-        loss = net(inputs, device)
+        if args.model == 'setfsl':
+            loss = net(inputs, labels, device)
+        else:
+            loss = net(inputs, device)
         
         optimizer.zero_grad()
         loss.backward()
@@ -45,7 +49,7 @@ def train_per_epoch(args, dataloader, net, optimizer, scheduler, device):
                 else:
                     representations = torch.cat((representations, net.encoding(inputs)), dim=0)
                     label_list = torch.cat((label_list, labels), dim=0)
-            
+        
         running_loss += loss.item()
         
     return running_loss/len(dataloader), representations, label_list
@@ -96,21 +100,26 @@ def fewshot_test(testloader, net, args, device):
 def crossdomain_test(args, net, device, outputs_log):
     print('--- crossdomain test ---')
     if args.dataset == 'BSCD':
-        dataset_list = ['CropDisease','EuroSAT', 'ISIC', 'ChestX']
+        dataset_list = ['CropDisease','EuroSAT', 'ISIC', 'ChestX', 'miniimagenet']
     elif args.dataset == 'FWT':
-        dataset_list = ['cars', 'cub', 'places', 'plantae']
+        dataset_list = ['cub', 'cars', 'places', 'plantae']
     elif args.dataset == 'all':
-        dataset_list = ['CropDisease','EuroSAT', 'ISIC', 'ChestX','cars', 'cub', 'places', 'plantae']
+        dataset_list = ['CropDisease','EuroSAT', 'ISIC', 'ChestX','cub', 'cars', 'places', 'plantae']
     else:
         print('invalid dataset')
         return
     
+    total = 0
     for dataset in dataset_list:
         trainloader, testloader, valloader, num_classes = dataloader.load_dataset(args, dataset)
         print(f'--- {dataset} test ---')
         acc = fewshot_test(testloader, net, args, device=device)
+        total += acc
         print(f'{dataset} fewshot_acc : %.3f'%(acc))
         print(f'{dataset} fewshot_acc : %.3f'%(acc), file=outputs_log)
+    mean = total / len(dataset_list)
+    print(f'mean_acc : %.3f'%(mean))
+    print(f'mean_acc : %.3f'%(mean), file=outputs_log)
 
 
 def train(args, trainloader, testloader, valloader, net, optimizer, scheduler, device, writer, outputs_log):
@@ -123,6 +132,7 @@ def train(args, trainloader, testloader, valloader, net, optimizer, scheduler, d
             acc = knn_test(testloader, net, representations, label_list, device)
             writer.add_scalar('train / KNN_acc', acc, epoch+1)
         elif args.test == 'fewshot' and (epoch+1) % 5 == 0 or epoch == 0:
+            #print(F.softmax(net.decoder.weight_for_blk))
             acc = fewshot_test(valloader, net, args, device=device)
             writer.add_scalar('train / fewshot_acc', acc, epoch+1)
         
@@ -136,10 +146,10 @@ def train(args, trainloader, testloader, valloader, net, optimizer, scheduler, d
         writer.add_scalar('train / learning_rate', lr, epoch+1)
         
         torch.save(net.state_dict(), f'./{args.model}_{args.epochs}ep_{args.learningrate}lr_{args.log}.pt')
-        
+        '''
         if acc > max_acc:
             torch.save(net.state_dict(), f'./{args.model}_best_ep_{args.learningrate}lr_{args.log}.pt')
-        
+        '''
         running_loss = 0.0
         
     print('Training finished',file=outputs_log)
@@ -164,9 +174,9 @@ def main():
     trainable_parameters = sum(p.numel() for p in net.encoder.parameters() if p.requires_grad)
     total_parameters = sum(p.numel() for p in net.encoder.parameters())
     print(trainable_parameters, total_parameters)
-    net.load_state_dict(torch.load('ijepa_20ep_1e-07lr_use_DINOweight.pt'))
+    #net.load_state_dict(torch.load('setfsl_300ep_0.001lr_test_layer11_mean_withnorm.pt'), strict= False)
     
-    #net.encoder.load_state_dict(torch.load('./checkpoint/dino_deitsmall16_pretrain.pth'))
+    net.encoder.load_state_dict(torch.load('./checkpoint/dino_deitsmall16_pretrain.pth'), strict= False)
     #net.target_encoder.load_state_dict(torch.load('./checkpoint/dino_deitsmall16_pretrain.pth'))
     
     if args.train:
