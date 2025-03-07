@@ -8,13 +8,42 @@ import math
 import numpy as np
 
 from utils import split_support_query_set
-from backbone import visiontransformer as vit
+import backbone.vit_encoder as vit_encoder
+import backbone.vit_predictor as vit_predictor
 
 from tqdm import tqdm
 
-from models.ijepa_utils import repeat_interleave_batch, apply_masks
-from models.mae import MIM
+from backbone.vit_utils import repeat_interleave_batch, apply_masks
 
+class MIM(nn.Module):
+    def __init__(self, img_size, patch_size):
+        super(MIM, self).__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (self.img_size // self.patch_size) ** 2
+    
+    def load_backbone(self, encoder_add_cls_token=False, pred_add_cls_token=False, setfsl=False):
+        print('img_size: ',self.img_size)
+        print('patch_size: ',self.patch_size)
+        print('num_patches: ',self.num_patches)
+        encoder = vit_encoder.__dict__['vit_small'](img_size=[self.img_size], patch_size=self.patch_size, add_cls_token=encoder_add_cls_token)
+        predictor = vit_predictor.__dict__['vit_predictor'](patch_size=self.patch_size, num_patches= (self.img_size//self.patch_size) ** 2, embed_dim=encoder.embed_dim, 
+                                                predictor_embed_dim=encoder.embed_dim//2, num_heads=encoder.num_heads, add_cls_token=pred_add_cls_token)
+        
+        return encoder, predictor
+    
+    def attn_weighted_sum(self, x, encoder):
+        x, attn = encoder(x, return_attn=True) # use cls token
+        cls_token = x[:, 0, :]
+        patch_tokens = x[:, 1:, :]
+        attn_weights = attn.mean(axis = 1)[:, 0, 1:] # head별 mean 계산 후 cls token 분리(cls token 제외 나머지 token들에 대해) B 1 num_patches
+        attn_weights = attn_weights / attn_weights.sum(axis=-1, keepdims=True)
+        weighted_patch_tokens = torch.sum(patch_tokens * attn_weights.unsqueeze(-1), dim=1) # B N D * B N -> B D
+        
+        x = torch.cat((cls_token, weighted_patch_tokens), dim=-1)
+        x = F.normalize(x, dim=-1)
+        
+        return x
 
 class I_JEPA(MIM):
     def __init__(self, img_size, patch_size, num_epochs):
@@ -55,12 +84,8 @@ class I_JEPA(MIM):
         
         def forward_target():
             with torch.no_grad():
-                feature_lst = self.target_encoder(imgs, return_attn=False, find_optimal_target=True) # B num_patches D
-
-            feature_weight = nn.functional.softmax(self.feature_weight)
-            feature_lst = torch.stack(feature_lst) # layer B P D
-            h = torch.einsum('lbpd, l -> bpd', feature_lst, feature_weight)
-            
+                h = self.target_encoder(imgs, return_attn=False) # B num_patches D
+                
             with torch.no_grad():
                 h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim => patch 별
                 B = len(h)
@@ -101,16 +126,14 @@ class I_JEPA(MIM):
             total = 0
             
             x = torch.mean(encoder(inputs), dim=1) # B K D -> B D
-            #x = encoder(inputs)[:, 0, :] # use cls token
-            #batchnorm = nn.BatchNorm1d(x.size(1), affine=False, eps=1e-6).to(device)
-            #x = batchnorm(x)
+            #x = self.attn_weighted_sum(inputs, encoder)
+            #x = encoder(inputs)[:, 0, :]
             
             tasks = split_support_query_set(x, labels, device, num_tasks=1, num_shots=args.num_shots)
             
             for x_support, x_query, y_support, y_query in tasks:
-                x_support = F.normalize(x_support)
-                x_query = F.normalize(x_query) # q d
-                prototypes = F.normalize(torch.sum(x_support.view(5, args.num_shots, -1), dim=1), dim=1) # 5 d
+                x_query = F.normalize(x_query, dim=-1) # q d
+                prototypes = F.normalize(torch.mean(x_support.view(5, args.num_shots, -1), dim=1), dim=-1) # 5 d
                 
                 logits = torch.einsum('qd, wd -> qw', x_query, prototypes)
                 _, predicted = torch.max(logits.data, 1)
@@ -119,73 +142,3 @@ class I_JEPA(MIM):
                 
             acc = 100 * correct / total
         return acc
-    
-    def ft_fewshot_acc(self, loader, device, n_iters, args):
-        #linear probing
-        total_acc = 0
-        
-        for data in tqdm(loader, desc="Test ..."):
-            inputs, labels = data
-            inputs, labels = inputs.to(device), labels.to(device)
-            
-            tasks = split_support_query_set(inputs, labels, device, num_tasks=1, num_shots=args.num_shots)
-            correct, total = 0, 0
-            
-            for x_support, x_query, y_support, y_query in tasks:
-                if args.model == 'ijepa':
-                    net = copy.deepcopy(self.target_encoder)
-                else:
-                    net = copy.deepcopy(self.encoder)
-                    
-                classifier = nn.Sequential(
-                    #nn.BatchNorm1d(self.encoder.embed_dim, affine=False, eps=1e-6),
-                    nn.Linear(self.encoder.embed_dim*2, args.train_num_ways)).to(device)
-                optimizer = optim.SGD(classifier.parameters(), lr=0.01, momentum=0.9, weight_decay=0.001)
-                
-                net.eval()
-                classifier.train()
-                
-                with torch.no_grad():
-                    # global avg pooling
-                    #shots   = torch.mean(net(x_support), dim=1)
-                    #queries = torch.mean(net(x_query), dim=1)
-                    
-                    # attn_weighted sum
-                    shots = self.attn_weighted_sum(x_support, net)
-                    queries = self.attn_weighted_sum(x_query, net)
-                    
-                    # cls token
-                    #shots   = net(x_support)[:, 0, :]
-                    #queries = net(x_query)[:, 0, :]
-                    
-                for _ in range(100):
-                    with torch.no_grad():
-                        shots   = shots.detach()
-                        queries = queries.detach()
-                        
-                    rand_id = np.random.permutation(args.train_num_ways * args.num_shots)
-                    batch_indices = [rand_id[i*4:(i+1)*4] for i in range(rand_id.size//4)]
-                    for id in batch_indices:
-                        x_train = shots[id]
-                        y_train = y_support[id]
-                        shots_pred = classifier(x_train)
-                        loss = F.cross_entropy(shots_pred, y_train)
-                        
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                
-                net.eval()
-                classifier.eval()
-                
-                with torch.no_grad():
-                    logits = classifier(queries)
-                    _, predicted = torch.max(logits.data, 1)
-                    correct += (predicted == y_query).sum().item()
-                    total += y_query.size(0)
-                    
-            acc = 100 * correct / total
-            total_acc += acc
-            
-        accuracy = total_acc / len(loader)
-        return accuracy

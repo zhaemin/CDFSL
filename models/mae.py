@@ -10,42 +10,11 @@ import numpy as np
 
 from utils import split_support_query_set
 
-from backbone import visiontransformer as vit
+from backbone import vision_transformer as vit
 
 from tqdm import tqdm
 
-class MIM(nn.Module):
-    def __init__(self, img_size, patch_size):
-        super(MIM, self).__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = (self.img_size // self.patch_size) ** 2
-    
-    def load_backbone(self, encoder_add_cls_token=False, pred_add_cls_token=False, setfsl=False):
-        print('img_size: ',self.img_size)
-        print('patch_size: ',self.patch_size)
-        print('num_patches: ',self.num_patches)
-        encoder = vit.__dict__['vit_small'](img_size=[self.img_size], patch_size=self.patch_size, add_cls_token=encoder_add_cls_token)
-        if setfsl:
-            decoder = vit.__dict__['vit_decoder'](self.num_patches, encoder.embed_dim, encoder.num_heads)
-        else:
-            decoder = vit.__dict__['vit_predictor'](patch_size=self.patch_size, num_patches= (self.img_size//self.patch_size) ** 2, embed_dim=encoder.embed_dim, 
-                                                predictor_embed_dim=encoder.embed_dim//2, num_heads=encoder.num_heads, add_cls_token=pred_add_cls_token)
-        
-        return encoder, decoder
-    
-    def attn_weighted_sum(self, x, encoder):
-        x, attn = encoder(x, return_attn=True) # use cls token
-        cls_token = x[:, 0, :]
-        patch_tokens = x[:, 1:, :]
-        attn_weights = attn.mean(axis = 1)[:, 0, 1:] # head별 mean 계산 후 cls token 분리(cls token 제외 나머지 token들에 대해) B 1 num_patches
-        attn_weights = attn_weights / attn_weights.sum(axis=-1, keepdims=True)
-        weighted_patch_tokens = torch.sum(patch_tokens * attn_weights.unsqueeze(-1), dim=1) # B N D * B N -> B D
-        
-        x = torch.cat((cls_token, weighted_patch_tokens), dim=-1)
-        x = F.normalize(x, dim=-1)
-        
-        return x
+from models.ijepa import MIM
 
 
 class MAE(MIM):

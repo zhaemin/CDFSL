@@ -7,7 +7,6 @@ import copy
 from tqdm import tqdm
 import numpy as np
 
-import backbone.encoders as encoders
 from models.SSL import SSLFramework
 
 from utils import split_support_query_set, mixup

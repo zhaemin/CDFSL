@@ -9,8 +9,8 @@ from tqdm import tqdm
 import numpy as np
 
 
-import backbone.encoders as encoders
-import backbone.visiontransformer as vit
+import backbone.resnet_encoder as encoders
+import backbone.vision_transformer as vit
 
 from utils import split_support_query_set
 
