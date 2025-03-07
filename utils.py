@@ -39,12 +39,25 @@ def parsing_argument():
     parser.add_argument('-img_size', '--img_size', metavar='int', type=int, help='input img size', default=84)
     parser.add_argument('-patch_size', '--patch_size', metavar='int', type=int, help='patch size', default=6)
     
+    # for setfsl
+    parser.add_argument('-num_g_prompts', '--num_g_prompts', metavar='int', type=int, help='patch size', default=0)
+    parser.add_argument('-num_e_prompts', '--num_e_prompts', metavar='int', type=int, help='patch size', default=0)
+    parser.add_argument('-temperature', '--temperature', metavar='float', type=float, help='patch size', default=0.001)
+    parser.add_argument('-prompt', '--prompt', metavar='str', type=str, help='prefix, prompt', default='prompt')
+    
+    parser.add_argument('-num_objects', '--num_objects', metavar='int', type=int, default=2)
+    parser.add_argument('-layer', '--layer', metavar='int', type=int, default=11)
+    parser.add_argument('-withcls', '--withcls', action='store_true')
+    parser.add_argument('-continual_layers', '--continual_layers', nargs='+', type=int, default=None)
+    
+    parser.add_argument('-train_w_qkv', '--train_w_qkv', action='store_true')
+    parser.add_argument('-train_w_o', '--train_w_o', action='store_true')
+    
     return parser.parse_args()
 
 def set_parameters(args, net, len_trainloader):
     if args.optimizer == 'adamW':
-        optimizer = optim.AdamW([{'params':net.encoder.parameters(), 'lr':args.learningrate}, {'params':net.predictor.parameters(), 'lr':args.learningrate*10}])
-        # eta_min=1e-7로 조정하기
+        optimizer = optim.AdamW(params=net.parameters(), lr=args.learningrate)
         scheduler = WarmupCosineAnnealingScheduler(optimizer, warmup_steps=args.warmup, base_lr=args.learningrate, T_max=args.epochs, eta_min=1e-6)
         #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=1e-6)
         #scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 40, 80, 100, 120], gamma=0.5)
@@ -92,28 +105,36 @@ def mixup(input, alpha):
     output = lam_expanded * input + (1. - lam_expanded) * input[randind]
     return output, randind, lam
 
-import models.SSL as ssl
-import models.psco as psco
-import models.vicreg as vicreg
-import models.ijepa as ijepa
-import models.mae as mae
-import models.fewshot_models as fewshot_models
-
 def load_model(args):
     if args.model == 'moco':
+        import models.SSL as ssl
         net = ssl.MoCo(args.backbone, q_size=16384, momentum=0.99)
     elif args.model == 'simclr':
+        import models.SSL as ssl
         net = ssl.SimCLR(args.backbone)
     elif args.model == 'swav':
+        import models.SSL as ssl
         net = ssl.SwAV(args.backbone)
     elif args.model == 'psco':
+        import models.SSL as ssl
+        import models.psco as psco
         net = psco.PsCo(args.backbone, mixup=args.mixup)
     elif args.model == 'protonet':
+        import models.fewshot_models as fewshot_models
         net = fewshot_models.ProtoNet()
     elif args.model == 'vicreg':
+        import models.vicreg as vicreg
         net = vicreg.VICReg(args.backbone, mixup=args.mixup)
     elif args.model == 'ijepa':
+        import models.mae as mae
+        import models.ijepa as ijepa
         net = ijepa.I_JEPA(args.img_size, args.patch_size, num_epochs=args.epochs)
     elif args.model == 'mae':
+        import models.mae as mae
+        import models.ijepa as ijepa
         net = mae.MAE(args.img_size, args.patch_size)
+    elif args.model == 'setfsl':
+        import models.setfsl as setfsl
+        #net = setfsl.SET_FSL(args.img_size, args.patch_size, args.num_g_prompts, args.num_e_prompts, args.temperature, args.prompt, args.num_shots)
+        net = setfsl.SET_FSL(args.img_size, args.patch_size, args.num_objects, args.temperature, args.layer, args.withcls, args.continual_layers, args.train_w_qkv, args.train_w_o)
     return net
