@@ -24,6 +24,7 @@ class CrossAttention(nn.Module):
         v = self.v(y)
         
         z = F.scaled_dot_product_attention(q, k, v)
+        z = self.o(z)
         
         return z
 
