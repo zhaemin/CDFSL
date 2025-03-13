@@ -135,6 +135,5 @@ def load_model(args):
         net = mae.MAE(args.img_size, args.patch_size)
     elif args.model == 'setfsl':
         import models.setfsl as setfsl
-        #net = setfsl.SET_FSL(args.img_size, args.patch_size, args.num_g_prompts, args.num_e_prompts, args.temperature, args.prompt, args.num_shots)
-        net = setfsl.SET_FSL(args.img_size, args.patch_size, args.num_objects, args.temperature, args.layer, args.withcls, args.continual_layers, args.train_w_qkv, args.train_w_o)
+        net = setfsl.SETFSL(args.img_size, args.patch_size, args.num_objects, args.temperature, args.layer, args.withcls, args.continual_layers, args.train_w_qkv, args.train_w_o)
     return net
