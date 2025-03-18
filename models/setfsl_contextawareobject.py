@@ -29,6 +29,20 @@ class CrossAttention(nn.Module):
         
         return z
 
+class SelfAttention(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.qkv = nn.Linear(input_dim, input_dim * 3)
+        self.o = nn.Linear(input_dim, output_dim)
+        
+    def forward(self, x):
+        qkv = self.qkv(x)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        z = F.scaled_dot_product_attention(q, k, v)
+        z = self.o(z)
+        
+        return z
+
 class SETFSL(nn.Module):
     def __init__(self, img_size, patch_size, num_objects, temperature, layer, with_cls=False, continual_layers=None, train_w_qkv=False, train_w_o=False):
         super(SETFSL, self).__init__()
@@ -55,6 +69,8 @@ class SETFSL(nn.Module):
         self.norm1 = nn.LayerNorm(self.encoder_dim)
         self.norm2 = nn.LayerNorm(self.ca_dim)
         
+        self.selfattn = SelfAttention(self.encoder_dim, self.encoder_dim)
+        
         # continual CA
         if continual_layers != None:
             self.object_queries = nn.Embedding(self.num_objects, self.encoder_dim)
@@ -79,7 +95,7 @@ class SETFSL(nn.Module):
         
         for param in self.encoder.parameters():
             param.requires_grad = False
-        
+            
         print('num_object:', num_objects,' temerature:', temperature, ' layer:', layer, ' withcls:', with_cls, ' train_w_qkv:', train_w_qkv, ' train_w_o:', train_w_o,
               'ca_dim:', self.ca_dim)
         
@@ -99,55 +115,64 @@ class SETFSL(nn.Module):
     def make_o_identity(self, crossattn):
         crossattn.o = nn.Identity()
     
-    def individual_crossattn(self, z):
-        q = self.object_queries.weight
+    def layernorm_affine_false(self):
+        self.encoder.norm
+    
+    def individual_crossattn(self, z, object_queries):
+        q = object_queries
         kv = z[self.layer]
         x = self.crossattn(q, kv)
         
         return x
     
-    def continual_crossattn(self, z, train=True):
-        object_queries = self.object_queries.weight
+    def continual_crossattn(self, z, object_queries):
         x = object_queries
         
-        if train:
-            layer_nums = random.sample(self.layer_nums, len(self.layer_nums)//2)
-        else:
-            layer_nums = self.layer_nums
-        
-        for l in layer_nums:
+        for blk, l in zip(self.ca_blocks, self.layer_nums):
             q = x
             kv = z[l]
-            x = self.ca_blocks[l](q, kv)
+            x = blk(q, kv)
             
             x = x + q
             
         return x
         
     def forward(self, inputs, labels, device):
-        with torch.no_grad():
-            z = self.encoder(inputs, return_attn=False, memories=True)
-        
-        if self.continual_layers == None:
-            # test 1
-            z = self.individual_crossattn(z)
-        else:
-            # test 2
-            z = self.continual_crossattn(z)
-        z = self.norm2(z)
-        
-        num_objects = self.num_objects
-        tasks = split_support_query_set(z, labels, device, num_tasks=1, num_shots=5)
+        tasks = split_support_query_set(inputs, labels, device, num_tasks=1, num_shots=5)
         
         loss = 0
         for x_support, x_query, y_support, y_query in tasks:
-            x_query = F.normalize(x_query, dim=-1)
-            shots = x_support.size(0) // 5
-            prototypes = F.normalize(torch.mean(x_support.view(5, shots, -1, self.ca_dim), dim=1), dim=-1)
+            x_support = self.encoder(x_support, return_attn=False, memories=True)
+            x_query = self.encoder(x_query, return_attn=False, memories=True)
             
+            shots = x_support.size(1) // 5
+            x_support_cls = x_support[self.layer][:, 0, :].unsqueeze(1)
+            prototypes_cls = F.normalize(torch.mean(x_support_cls.view(5, shots, self.ca_dim), dim=1), dim=-1) # 5 384
+            
+            x = torch.concat((prototypes_cls, self.object_queries.weight), dim=0) # 6 384
+            #context_object_queries = self.selfattn(x)[-1, :].unsqueeze(0)
+            context_object_queries = x
+            
+            if self.continual_layers == None:
+                # test 1
+                x_query = self.individual_crossattn(x_query, context_object_queries)
+                x_support = self.individual_crossattn(x_support, context_object_queries) # supports 1 384
+            else:
+                # test 2
+                x_query = self.continual_crossattn(x_query, context_object_queries)
+                x_support = self.continual_crossattn(x_support, context_object_queries)
+            x_query = self.norm2(x_query) # 75 1 384
+            x_support = self.norm2(x_support)
+            #x_query = self.norm2(x_query[:, -1, :]) # 75 1 384
+            #x_support = self.norm2(x_support[:, -1, :])
+            
+            num_objects = self.num_objects
+            
+            prototypes = F.normalize(torch.mean(x_support.view(5, shots, self.ca_dim), dim=1), dim=-1) # 5 384
             x_query = x_query.transpose(0, 1) # objects queries dim
-            prototypes = prototypes.transpose(0, 1) # objects 5 dim
+            prototypes = prototypes.unsqueeze(1).transpose(0, 1) # objects 5 dim
             
+            x_query = F.normalize(x_query, dim=-1)
             distance = torch.einsum('oqd, owd -> oqw', x_query, prototypes).transpose(0, 1) # queries objects 5
             
             y_query = y_query.unsqueeze(1).repeat(1, num_objects).view(-1)
@@ -158,33 +183,39 @@ class SETFSL(nn.Module):
     
     def fewshot_acc(self, args, inputs, labels, device):
         with torch.no_grad():
-            correct = 0
-            total = 0
-            
-            z = self.encoder(inputs, return_attn=False, memories=True)
-            
-            cls_token = z[self.layer][:, 0, :].unsqueeze(1)
-            
-            if self.continual_layers == None:
-                z = self.individual_crossattn(z)
-            else:
-                z = self.continual_crossattn(z, train=False)
-            z = self.norm2(z)
-            
-            if self.with_cls:
-                z = torch.concat((z, cls_token), dim=1)
-            
-            tasks = split_support_query_set(z, labels, device, num_tasks=1, num_shots=5)
+            tasks = split_support_query_set(inputs, labels, device, num_tasks=1, num_shots=5)
             
             loss = 0
+            correct = 0
+            total = 0
             for x_support, x_query, y_support, y_query in tasks:
-                x_query = F.normalize(x_query, dim=-1)
-                shots = x_support.size(0) // 5
-                prototypes = F.normalize(torch.mean(x_support.view(5, shots, -1, self.ca_dim), dim=1), dim=-1)
+                x_support = self.encoder(x_support, return_attn=False, memories=True)
+                x_query = self.encoder(x_query, return_attn=False, memories=True)
                 
+                shots = x_support.size(1) // 5
+                x_support_cls = x_support[self.layer][:, 0, :].unsqueeze(1)
+                prototypes_cls = F.normalize(torch.mean(x_support_cls.view(5, shots, self.ca_dim), dim=1), dim=-1) # 5 384
+                
+                x = torch.concat((prototypes_cls, self.object_queries.weight), dim=0) # 6 384
+                #context_object_queries = self.selfattn(x)[-1, :].unsqueeze(0)
+                context_object_queries = x
+                
+                if self.continual_layers == None:
+                    # test 1
+                    x_query = self.individual_crossattn(x_query, context_object_queries)
+                    x_support = self.individual_crossattn(x_support, context_object_queries) # supports 1 384
+                else:
+                    # test 2
+                    x_query = self.continual_crossattn(x_query, context_object_queries)
+                    x_support = self.continual_crossattn(x_support, context_object_queries)
+                x_query = self.norm2(x_query) # 75 1 384
+                x_support = self.norm2(x_support)
+            
+                prototypes = F.normalize(torch.mean(x_support.view(5, shots, self.ca_dim), dim=1), dim=-1) # 5 384
                 x_query = x_query.transpose(0, 1) # objects queries dim
-                prototypes = prototypes.transpose(0, 1) # objects 5 dim
+                prototypes = prototypes.unsqueeze(1).transpose(0, 1) # objects 5 dim
                 
+                x_query = F.normalize(x_query, dim=-1)
                 distance = torch.einsum('oqd, owd -> oqw', x_query, prototypes).transpose(0, 1) # queries objects 5
                 
                 logits = distance.mean(dim=1)
