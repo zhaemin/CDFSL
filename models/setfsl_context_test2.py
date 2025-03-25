@@ -18,6 +18,11 @@ class CrossAttention(nn.Module):
         self.k = nn.Linear(input_dim, output_dim)
         self.v = nn.Linear(input_dim, output_dim)
         self.o = nn.Linear(output_dim, output_dim)
+        self.init_o()
+        
+    def init_o(self):
+        nn.init.zeros_(self.o.weight)
+        nn.init.zeros_(self.o.bias)
     
     def forward(self, x, y):
         q = self.q(x)
@@ -119,6 +124,7 @@ class SETFSL(nn.Module):
         q = object_queries
         kv = z[self.layer]
         x = self.crossattn(q, kv)
+        x = q + x
         
         return x
     
@@ -145,21 +151,20 @@ class SETFSL(nn.Module):
             shots = x_support.size(1) // 5
             x_support_cls = x_support[self.layer][:, 0, :].unsqueeze(1)
             prototypes_cls = F.normalize(torch.mean(x_support_cls.view(5, shots, self.ca_dim), dim=1), dim=-1) # 5 384
-            
-            x = torch.concat((prototypes_cls, self.object_queries.weight), dim=0) # 6 384
-            context_object_queries = x
+            prototypes_cls = torch.concat((prototypes_cls, self.object_queries.weight), dim=0)
             
             if self.continual_layers == None:
                 # test 1
-                contextualized_x = self.individual_crossattn(x_query, context_object_queries)
+                contextualized_x = self.individual_crossattn(x_query, prototypes_cls)
             else:
                 # test 2
-                contextualized_x  = self.continual_crossattn(x_query, context_object_queries)
-            x_query = self.norm(contextualized_x[:, -1, :]).unsqueeze(dim=1) # 75 1 384
-            prototypes = self.norm(contextualized_x[:, :-1, :]) # 75 5 384
+                contextualized_x  = self.continual_crossattn(x_query, prototypes_cls)
             
-            prototypes = F.normalize(prototypes, dim=-1) # 5 384
-            x_query = F.normalize(x_query, dim=-1)
+            prototypes = self.norm(contextualized_x[:, :-1, :])
+            x_query = self.norm(contextualized_x[:, -1, :])
+            
+            prototypes = F.normalize(prototypes, dim=-1) # 75 5 384
+            x_query = F.normalize(x_query, dim=-1).unsqueeze(dim=1) # 75 1 384
             
             distance = torch.einsum('bqd, bwd -> bqw', x_query, prototypes) # 75 5
             
@@ -169,11 +174,11 @@ class SETFSL(nn.Module):
         return loss
     
     def fewshot_acc(self, args, inputs, labels, device):
-        loss = 0
-        total = 0
-        correct = 0
-        
         with torch.no_grad():
+            correct = 0
+            total = 0
+            loss = 0
+            
             tasks = split_support_query_set(inputs, labels, device, num_tasks=1, num_shots=5)
             
             for x_support, x_query, y_support, y_query in tasks:
@@ -183,25 +188,25 @@ class SETFSL(nn.Module):
                 shots = x_support.size(1) // 5
                 x_support_cls = x_support[self.layer][:, 0, :].unsqueeze(1)
                 prototypes_cls = F.normalize(torch.mean(x_support_cls.view(5, shots, self.ca_dim), dim=1), dim=-1) # 5 384
-                
-                x = torch.concat((prototypes_cls, self.object_queries.weight), dim=0) # 6 384
-                context_object_queries = x
+                prototypes_cls = torch.concat((prototypes_cls, self.object_queries.weight), dim=0)
                 
                 if self.continual_layers == None:
                     # test 1
-                    contextualized_x = self.individual_crossattn(x_query, context_object_queries)
+                    contextualized_x = self.individual_crossattn(x_query, prototypes_cls)
                 else:
                     # test 2
-                    contextualized_x  = self.continual_crossattn(x_query, context_object_queries)
-                x_query = self.norm(contextualized_x[:, -1, :]).unsqueeze(dim=1) # 75 1 384
-                prototypes = self.norm(contextualized_x[:, :-1, :]) # 75 5 384
+                    contextualized_x  = self.continual_crossattn(x_query, prototypes_cls)
                 
-                prototypes = F.normalize(prototypes, dim=-1) # 5 384
-                x_query = F.normalize(x_query, dim=-1)
+                prototypes = self.norm(contextualized_x[:, :-1, :])
+                x_query = self.norm(contextualized_x[:, -1, :])
+                
+                prototypes = F.normalize(prototypes, dim=-1) # 75 5 384
+                x_query = F.normalize(x_query, dim=-1).unsqueeze(dim=1) # 75 1 384
                 
                 distance = torch.einsum('bqd, bwd -> bqw', x_query, prototypes) # 75 5
                 
                 logits = (distance / self.temperature).reshape(-1, 5)
+
                 loss += F.cross_entropy(logits, y_query)
                 
                 _, predicted = torch.max(logits.data, 1)
@@ -210,3 +215,32 @@ class SETFSL(nn.Module):
                 
             acc = 100 * correct / total
         return acc
+
+    def return_prototypes(self, inputs, labels, device):
+        
+        tasks = split_support_query_set(inputs, labels, device, num_tasks=1, num_shots=5, num_queries=1)
+        for x_support, x_query, y_support, y_query in tasks:
+            x_support = self.encoder(x_support, return_attn=False, memories=True)
+            x_query = self.encoder(x_query, return_attn=False, memories=True)
+            
+            shots = x_support.size(1) // 5
+            x_support_cls = x_support[self.layer][:, 0, :].unsqueeze(1)
+            prototypes_cls = F.normalize(torch.mean(x_support_cls.view(5, shots, self.ca_dim), dim=1), dim=-1) # 5 384
+            
+            if self.continual_layers == None:
+                # test 1
+                contextualized_x = self.individual_crossattn(x_query, prototypes_cls)
+            else:
+                # test 2
+                contextualized_x  = self.continual_crossattn(x_query, prototypes_cls)
+            prototypes = self.norm(contextualized_x) # 75 5 384
+            
+            prototypes = F.normalize(prototypes, dim=-1)
+            x_query = F.normalize(x_query[self.layer][:, 0, :], dim=-1) # queries 384
+            
+            prototypes = prototypes[0]
+            x_query = x_query[0].unsqueeze(0)
+            y_query = y_query[0]
+        
+            
+        return prototypes, x_query, y_query
